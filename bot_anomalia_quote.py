@@ -25,8 +25,8 @@ RAPIDAPI_BASE  = os.getenv("RAPIDAPI_BASE", f"https://{RAPIDAPI_HOST}")
 RAPIDAPI_EVENTS_PATH   = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
 RAPIDAPI_EVENTS_PARAMS = dict(parse_qsl(os.getenv("RAPIDAPI_EVENTS_PARAMS", "sport=soccer")))
 
-# ODDS: mercati di UN evento (ID nel PATH!)
-# Esempio per bet365data: /live-events/{event_id}
+# ODDS: mercati di UN evento (ID nel PATH!) per bet365data
+# es: GET https://bet365data.p.rapidapi.com/live-events/{event_id}
 RAPIDAPI_ODDS_PATH      = os.getenv("RAPIDAPI_ODDS_PATH", "/live-events/{event_id}")
 RAPIDAPI_ODDS_QUERY_KEY = os.getenv("RAPIDAPI_ODDS_QUERY_KEY", "")  # lasciare stringa vuota
 
@@ -36,10 +36,18 @@ MIN_RISE       = float(os.getenv("MIN_RISE", "0.04"))    # aumento minimo (es. 1
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "5"))
 DEBUG_LOG      = os.getenv("DEBUG_LOG", "0") == "1"
 
-# Anti-rate limit
+# Diagnostica gol
+LOG_GOAL_DETECTED       = os.getenv("LOG_GOAL_DETECTED", "1") == "1"         # log a console
+TELEGRAM_ON_GOAL_DETECTED = os.getenv("TELEGRAM_ON_GOAL_DETECTED", "1") == "1"  # ping Telegram giallo
+
+# Anti-rate limit (per-second)
 MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "1"))
 ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "1200"))
 _last_odds_call_ts_ms   = 0
+
+# Cooldown automatico se il provider risponde "DAILY QUOTA" (di solito non serve su Ultra ma è sicuro)
+COOLDOWN_ON_DAILY_429_MIN = int(os.getenv("COOLDOWN_ON_DAILY_429_MIN", "30"))
+_last_daily_429_ts = 0
 
 # Filtri leghe/eventi rumorosi
 LEAGUE_EXCLUDE_KEYWORDS = [kw.strip().lower() for kw in os.getenv(
@@ -82,9 +90,17 @@ def send_telegram_message(message: str) -> bool:
     return False
 
 def http_get(url, headers=None, params=None, timeout=25):
+    global _last_daily_429_ts
     try:
         r = requests.get(url, headers=headers, params=params, timeout=timeout)
-        if not r.ok:
+        if r.status_code == 429:
+            txt = (r.text or "").lower()
+            if "daily quota" in txt or "exceeded the daily" in txt:
+                _last_daily_429_ts = int(time.time())
+                logger.error("HTTP 429 DAILY QUOTA su %s", url)
+            else:
+                logger.error("HTTP 429 per-second su %s", url)
+        elif not r.ok:
             logger.error("HTTP %s %s | body: %s", r.status_code, url, r.text[:300])
         return r
     except Exception as e:
@@ -112,7 +128,7 @@ def detect_scorer(prev: tuple[int,int], cur: tuple[int,int]) -> str | None:
     return None
 
 # =========================
-# LIVE: id, teams, score, minute, period (provider bet365data)
+# LIVE: id, teams, score, minute, period (bet365data)
 # =========================
 def get_live_matches():
     url = build_url(RAPIDAPI_EVENTS_PATH)
@@ -123,7 +139,6 @@ def get_live_matches():
     except Exception:
         logger.error("live-events non-JSON: %s", r.text[:300]); return []
 
-    # Il provider può restituire direttamente "events" o dentro "data"
     raw = (data.get("data") or {}).get("events") or data.get("events") or []
     events = []
 
@@ -141,7 +156,7 @@ def get_live_matches():
         home     = home.strip() if isinstance(home, str) else str(home)
         away     = away.strip() if isinstance(away, str) else str(away)
 
-        # alcuni provider mettono le keyword nel nome squadra: filtrale
+        # filtra se le keyword sono dentro ai nomi squadra
         if LEAGUE_EXCLUDE_KEYWORDS and (
             any(kw in home.lower() for kw in LEAGUE_EXCLUDE_KEYWORDS) or
             any(kw in away.lower() for kw in LEAGUE_EXCLUDE_KEYWORDS)
@@ -182,7 +197,7 @@ def get_live_matches():
     return events
 
 # =========================
-# ODDS: 1X2 + suspended (provider bet365data: /live-events/{id})
+# ODDS: 1X2 + suspended (bet365data: /live-events/{id})
 # =========================
 def get_event_odds_1x2(event_id: str):
     if not event_id: return None
@@ -197,10 +212,7 @@ def get_event_odds_1x2(event_id: str):
     except Exception:
         logger.error("odds non-JSON: %s", r.text[:300]); return None
 
-    # alcuni provider mettono tutto a root, altri sotto "data"
     root = data.get("data") or data
-
-    # markets può stare in "markets"/"Markets"/"odds"
     markets = root.get("markets") or root.get("Markets") or root.get("odds") or []
     if isinstance(markets, dict):
         markets = markets.get("markets") or markets.get("list") or [markets]
@@ -211,7 +223,7 @@ def get_event_odds_1x2(event_id: str):
         if "1x2" in key or key in ("match_result","full_time_result","ft_result","result"):
             pick = m; break
     if not pick and markets:
-        pick = markets[0]  # fallback: primo mercato
+        pick = markets[0]  # fallback: primo mercato disponibile
 
     home = draw = away = None
     suspended = None
@@ -246,8 +258,22 @@ def get_event_odds_1x2(event_id: str):
 def main_loop():
     send_telegram_message("🤖 <b>Bot Quote Jump avviato</b>\nMonitoraggio live entro 35'…")
 
+    global _last_daily_429_ts
+
     while True:
         try:
+            # cooldown se abbiamo preso un 429 daily di recente
+            if _last_daily_429_ts:
+                elapsed = int(time.time()) - _last_daily_429_ts
+                if elapsed < COOLDOWN_ON_DAILY_429_MIN * 60:
+                    remaining = COOLDOWN_ON_DAILY_429_MIN * 60 - elapsed
+                    if DEBUG_LOG:
+                        logger.info("In cooldown da DAILY 429: attendo %ds", remaining)
+                    time.sleep(min(remaining, CHECK_INTERVAL))
+                    continue
+                else:
+                    _last_daily_429_ts = 0  # fine cooldown
+
             live = get_live_matches()
             if not live:
                 time.sleep(CHECK_INTERVAL); continue
@@ -263,12 +289,11 @@ def main_loop():
                 minute= lm.get("minute")
                 period= lm.get("period")  # 1 = primo tempo
 
-                # Filtra: solo 1° tempo
+                # Solo 1° tempo
                 if period and int(period) != 1:
                     continue
-                # Se abbiamo minuto, deve essere <= 35'
+                # Se abbiamo il minuto, deve essere <= 35'
                 if minute is not None and minute > MINUTE_CUTOFF:
-                    # chiudi eventuale episodio pendente
                     st = match_state.get(eid or f"{home}|{away}|{league}")
                     if st and st.waiting_relist:
                         st.waiting_relist = False
@@ -287,13 +312,23 @@ def main_loop():
                 # 1) rileva gol
                 scorer = detect_scorer(st.last_score, cur_score)
                 if scorer:
+                    if LOG_GOAL_DETECTED:
+                        logger.info("GOL RILEVATO: %s vs %s | id=%s | score %s -> %s | period=%s | minute=%s",
+                                    home, away, eid,
+                                    f'{st.last_score[0]}-{st.last_score[1]}',
+                                    f'{cur_score[0]}-{cur_score[1]}',
+                                    period, minute)
+                    if TELEGRAM_ON_GOAL_DETECTED:
+                        send_telegram_message(
+                            f"🟡 Gol rilevato: <b>{home}</b> vs <b>{away}</b>\n"
+                            f"Score: <b>{st.last_score[0]}-{st.last_score[1]}</b> → <b>{cur_score[0]}-{cur_score[1]}</b>\n"
+                            f"{'⏱️ ' + str(minute) + \"'\" if minute is not None else '⏱️ 1T'} — in attesa quote…"
+                        )
+
                     st.waiting_relist = True
                     st.scoring_team = scorer
                     st.baseline = None
                     st.notified = False
-                    if DEBUG_LOG:
-                        logger.info("GOL %s: %s vs %s | score=%s | period=%s | minute=%s",
-                                    league, home, away, score, period, minute)
 
                 st.last_score = cur_score
                 st.last_period = period or 1
@@ -305,7 +340,7 @@ def main_loop():
                             logger.info("Nessun event_id per %s vs %s: impossibile leggere odds", home, away)
                         continue
 
-                    # throttle anti-429
+                    # throttle per-second
                     global _last_odds_call_ts_ms
                     now_ms = int(time.time() * 1000)
                     gap = now_ms - _last_odds_call_ts_ms
@@ -321,7 +356,7 @@ def main_loop():
 
                     suspended = odds.get("suspended")
 
-                    # fissa baseline alla prima quota attiva dopo il gol
+                    # baseline = prima quota attiva dopo il gol
                     if st.baseline is None:
                         if suspended is False or suspended is None:
                             base = odds["home"] if st.scoring_team == "home" else odds["away"]
@@ -330,7 +365,7 @@ def main_loop():
                                 if DEBUG_LOG:
                                     logger.info("Baseline %s: %.2f (%s vs %s)", st.scoring_team, base, home, away)
 
-                    # se c'è baseline, manda notifica quando la quota SALE di almeno MIN_RISE
+                    # quando la quota SALE di almeno MIN_RISE -> notifica
                     if st.baseline is not None and not st.notified:
                         current = odds["home"] if st.scoring_team == "home" else odds["away"]
                         if current is not None and current >= st.baseline + MIN_RISE:
@@ -338,7 +373,7 @@ def main_loop():
                                 "⚠️ <b>Quota in SALITA dopo il gol</b>\n\n"
                                 f"🏆 {league}\n"
                                 f"🏟️ <b>{home}</b> vs <b>{away}</b>\n"
-                                f"⏱️ <b>{minute if minute is not None else '1T'}</b> | Score: <b>{score}</b>\n"
+                                f"⏱️ <b>{minute if minute is not None else '1T'}</b> | Score: <b>{cur_score[0]}-{cur_score[1]}</b>\n"
                                 f"⚽ Ha segnato: <b>{home if st.scoring_team=='home' else away}</b>\n"
                                 f"📈 Quota {('1' if st.scoring_team=='home' else '2')} "
                                 f"baseline <b>{st.baseline:.2f}</b> → <b>{current:.2f}</b>"
