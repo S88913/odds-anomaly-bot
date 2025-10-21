@@ -1,24 +1,18 @@
 import os
 import time
-import csv
 import re
-import unicodedata
-from io import StringIO
-from datetime import datetime, timezone
-from urllib.parse import parse_qsl
-from difflib import SequenceMatcher
-
 import logging
 import requests
+from urllib.parse import parse_qsl
 
 # =========================
 # Logging
 # =========================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("odds-anomaly-bot")
+logger = logging.getLogger("quote-jump-bot")
 
 # =========================
-# Environment (come la tua base, con poche aggiunte)
+# Env
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.getenv("CHAT_ID", "")
@@ -27,50 +21,41 @@ RAPIDAPI_KEY   = os.getenv("RAPIDAPI_KEY", "")
 RAPIDAPI_HOST  = os.getenv("RAPIDAPI_HOST", "bet365data.p.rapidapi.com")
 RAPIDAPI_BASE  = os.getenv("RAPIDAPI_BASE", f"https://{RAPIDAPI_HOST}")
 
-# live events (come tua base)
+# Live events endpoint (ID + minute/period + score + teams)
 RAPIDAPI_EVENTS_PATH   = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
 RAPIDAPI_EVENTS_PARAMS = dict(parse_qsl(os.getenv("RAPIDAPI_EVENTS_PARAMS", "sport=soccer")))
 
-# NEW: endpoint quote evento (ADATTA QUI path e parametri)
-# Esempi:
-#   - path con query ?event_id=xxx   -> RAPIDAPI_ODDS_QUERY_KEY=event_id
-#   - path con segmento /{id}        -> lascia la query key vuota e usa il format nel build_url
+# Odds 1X2 endpoint (ADATTA ai tuoi)
+# Se l'ID va in query, lascia RAPIDAPI_ODDS_QUERY_KEY=event_id e usa '/event-odds'
+# Se l'ID va nel path, metti es. '/events/{event_id}/odds-1x2' e RAPIDAPI_ODDS_QUERY_KEY=""
 RAPIDAPI_ODDS_PATH      = os.getenv("RAPIDAPI_ODDS_PATH", "/event-odds")
-RAPIDAPI_ODDS_QUERY_KEY = os.getenv("RAPIDAPI_ODDS_QUERY_KEY", "event_id")  # "" se non serve query
+RAPIDAPI_ODDS_QUERY_KEY = os.getenv("RAPIDAPI_ODDS_QUERY_KEY", "event_id")
 
-GITHUB_CSV_URL      = os.getenv("GITHUB_CSV_URL", "")
-MINUTE_CUTOFF       = int(os.getenv("MINUTE_CUTOFF", "35"))   # limite 35'
-CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "4"))  # polling più reattivo dopo gol
-SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "1") == "1"
-DEBUG_LOG = os.getenv("DEBUG_LOG", "0") == "1"
+# Logica
+MINUTE_CUTOFF  = int(os.getenv("MINUTE_CUTOFF", "35"))   # entro il 35'
+MIN_RISE       = float(os.getenv("MIN_RISE", "0.04"))    # salto minimo: es. 1.36 -> >= 1.40
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "4"))
+DEBUG_LOG      = os.getenv("DEBUG_LOG", "0") == "1"
 
-# (Opzionale) Esclusioni campionati come tua base
-LEAGUE_EXCLUDE_KEYWORDS = [kw.strip().lower() for kw in os.getenv(
-    "LEAGUE_EXCLUDE_KEYWORDS", "Esoccer,Volta,8 mins play,H2H GG"
-).split(",") if kw.strip()]
+HEADERS = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
 
 # =========================
-# Stato: per ogni evento teniamo traccia di gol e quote
+# Stato per evento
 # =========================
 class GoalState:
-    __slots__ = (
-        "last_score","waiting_relist","scoring_team",
-        "baseline_odds","notified","last_seen_minute","last_suspended"
-    )
-    def __init__(self, score_tuple=(0,0), minute=0):
-        self.last_score = score_tuple       # (home, away)
-        self.waiting_relist = False         # true dopo il gol finché non riappaiono quote
-        self.scoring_team = None            # "home" | "away"
-        self.baseline_odds = None           # prima quota post-gol della squadra che ha segnato
-        self.notified = False               # una sola notifica per episodio
-        self.last_seen_minute = minute
-        self.last_suspended = None          # bool/None
+    __slots__ = ("last_score","waiting_relist","scoring_team","baseline","notified","last_period")
+    def __init__(self, score=(0,0), period=1):
+        self.last_score = score
+        self.waiting_relist = False
+        self.scoring_team = None     # "home" | "away"
+        self.baseline = None         # prima quota attiva post-gol (del team che ha segnato)
+        self.notified = False        # una sola notifica per episodio
+        self.last_period = period
 
-# key: event_id (se disponibile) altrimenti fallback su "home|away|league"
 match_state: dict[str, GoalState] = {}
 
 # =========================
-# Telegram
+# Helpers
 # =========================
 def send_telegram_message(message: str) -> bool:
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -80,16 +65,13 @@ def send_telegram_message(message: str) -> bool:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         r = requests.post(url, data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=15)
         if r.ok:
-            logger.info("Telegram: messaggio inviato")
+            if DEBUG_LOG: logger.info("Telegram: messaggio inviato")
             return True
         logger.error("Telegram %s: %s", r.status_code, r.text)
     except Exception as e:
         logger.exception("Telegram exception: %s", e)
     return False
 
-# =========================
-# HTTP helper
-# =========================
 def http_get(url, headers=None, params=None, timeout=25):
     try:
         r = requests.get(url, headers=headers, params=params, timeout=timeout)
@@ -105,165 +87,90 @@ def build_url(path: str, **fmt):
     p = path.format(**fmt).lstrip("/")
     return f"{base}/{p}"
 
-HEADERS = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
+def parse_score_tuple(ss: str) -> tuple[int,int]:
+    if not ss: return (0,0)
+    parts = re.findall(r"\d+", ss)
+    if len(parts) >= 2:
+        try: return (int(parts[0]), int(parts[1]))
+        except: return (0,0)
+    return (0,0)
+
+def detect_scorer(prev: tuple[int,int], cur: tuple[int,int]) -> str | None:
+    ph, pa = prev; ch, ca = cur
+    if (ch, ca) == (ph, pa): return None
+    if ch == ph + 1 and ca == pa: return "home"
+    if ca == pa + 1 and ch == ph: return "away"
+    return None
 
 # =========================
-# CSV (riuso dalla tua base per ricavare minute)
-# =========================
-def load_csv_from_github():
-    if not GITHUB_CSV_URL:
-        return []
-    try:
-        logger.info("Scarico CSV: %s", GITHUB_CSV_URL)
-        r = requests.get(GITHUB_CSV_URL, timeout=30)
-        r.raise_for_status()
-        rows = list(csv.DictReader(StringIO(r.text)))
-        logger.info("CSV caricato (%d righe)", len(rows))
-        return rows
-    except Exception as e:
-        logger.exception("Errore caricamento CSV: %s", e)
-        return []
-
-def strip_accents(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c))
-
-def norm_text(s: str) -> str:
-    s = strip_accents(s).lower()
-    s = re.sub(r"\(.*?\)", " ", s)
-    s = re.sub(r"[’'`]", " ", s)
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    return " ".join(s.split())
-
-STOPWORDS = {
-    "fc","cf","sc","ac","club","cd","de","del","da","do","d","u19","u20","u21","u23",
-    "b","ii","iii","women","w","reserves","team","sv","afc","youth","if","fk"
-}
-
-def team_tokens(name: str) -> set[str]:
-    toks = [t for t in norm_text(name).split() if t and t not in STOPWORDS]
-    toks = [t for t in toks if len(t) >= 3 or t.isdigit()]
-    return set(toks)
-
-def token_match(a: str, b: str) -> bool:
-    A, B = team_tokens(a), team_tokens(b)
-    if not A or not B:
-        return False
-    if A == B or A.issubset(B) or B.issubset(A):
-        return True
-    inter = A & B
-    if len(A) == 1 or len(B) == 1:
-        return len(inter) >= 1
-    return len(inter) >= 2
-
-def fuzzy_ratio(a: str, b: str) -> float:
-    return SequenceMatcher(None, norm_text(a), norm_text(b)).ratio()
-
-def match_teams(csv_match, live_match) -> bool:
-    csv_home = csv_match.get("Home Team") or csv_match.get("Home") or csv_match.get("home") or ""
-    csv_away = csv_match.get("Away Team") or csv_match.get("Away") or csv_match.get("away") or ""
-    live_home = live_match.get("home","")
-    live_away = live_match.get("away","")
-
-    if token_match(csv_home, live_home) and token_match(csv_away, live_away):
-        return True
-
-    rh = fuzzy_ratio(csv_home, live_home)
-    ra = fuzzy_ratio(csv_away, live_away)
-    return (rh >= 0.72 and ra >= 0.60) or (rh >= 0.60 and ra >= 0.72)
-
-def kickoff_minute_from_csv(csv_match) -> int | None:
-    candidate_keys = ["timestamp","epoch","unix","Date Unix","Kickoff Unix","start_time","start","time_unix"]
-    epoch_val = None
-
-    for k in candidate_keys:
-        if k in csv_match and str(csv_match[k]).strip():
-            try:
-                n = int(float(str(csv_match[k]).strip()))
-                if n >= 1_000_000_000:
-                    epoch_val = n
-                    break
-            except Exception:
-                pass
-
-    if epoch_val is None:
-        try:
-            first_key = next(iter(csv_match.keys()))
-            n = int(float(str(csv_match[first_key]).strip()))
-            if n >= 1_000_000_000:
-                epoch_val = n
-        except Exception:
-            pass
-
-    if epoch_val is None:
-        return None
-
-    now_utc = datetime.now(timezone.utc).timestamp()
-    minute = int(max(0, (now_utc - epoch_val) // 60))
-    return min(minute, 180)
-
-# =========================
-# Live events (RapidAPI) — ADATTA QUI il parsing (id, SS, squadre, lega)
+# LIVE: id, teams, score, minute, period
 # =========================
 def get_live_matches():
     url = build_url(RAPIDAPI_EVENTS_PATH)
     r = http_get(url, headers=HEADERS, params=RAPIDAPI_EVENTS_PARAMS, timeout=25)
-    if not r or not r.ok:
-        return []
-    try:
-        data = r.json() or {}
-    except Exception:
-        logger.error("Response non-JSON: %s", r.text[:300]); return []
+    if not r or not r.ok: return []
 
-    root = data.get("data") or {}
-    raw = root.get("events") or data.get("events") or []
+    try: data = r.json() or {}
+    except Exception:
+        logger.error("live-events non-JSON: %s", r.text[:300]); return []
+
+    raw = (data.get("data") or {}).get("events") or data.get("events") or []
     events = []
 
     for it in raw:
-        # id evento (prova più chiavi comuni)
+        # prova più chiavi per id/minuto/periodo
         event_id = str(it.get("id") or it.get("event_id") or it.get("EId") or it.get("fixtureId") or "")
-        league = (it.get("league") or it.get("CT") or it.get("competition") or "N/A").strip()
-        home   = (it.get("home") or it.get("HomeTeam") or it.get("homeTeam") or "").strip()
-        away   = (it.get("away") or it.get("AwayTeam") or it.get("awayTeam") or "").strip()
-        score  = (it.get("SS") or it.get("score") or "").strip()  # es. "1-0"
+        league   = (it.get("league") or it.get("CT") or it.get("competition") or "N/A").strip()
+        home     = (it.get("home") or it.get("HomeTeam") or it.get("homeTeam") or "").strip()
+        away     = (it.get("away") or it.get("AwayTeam") or it.get("awayTeam") or "").strip()
+        score    = (it.get("SS") or it.get("score") or "").strip()
 
-        if any(ex in league.lower() for ex in LEAGUE_EXCLUDE_KEYWORDS):
-            continue
+        raw_minute = it.get("minute") or it.get("clock") or it.get("time") or it.get("timeElapsed") or it.get("TM") or it.get("T") or it.get("clk")
+        minute = None
+        try:
+            minute = int(str(raw_minute).replace("'", "").replace("’","").strip()) if raw_minute is not None else None
+        except: minute = None
+
+        # periodo (1 = primo tempo). Molte API hanno 'period', 'half', 'status', 'phase'
+        raw_period = it.get("period") or it.get("half") or it.get("phase") or it.get("status")
+        period = 1
+        try:
+            # se è int/str "1", prendi 1; se "1st Half"/"HT"/"2nd Half" mappalo come serve
+            if isinstance(raw_period, (int, float)): period = int(raw_period)
+            elif isinstance(raw_period, str):
+                s = raw_period.lower()
+                if "1" in s or "first" in s: period = 1
+                elif "2" in s or "second" in s: period = 2
+                elif "ht" in s: period = 1
+                else: period = 1
+        except:
+            period = 1
+
         if home and away and score is not None:
             events.append({
                 "id": event_id, "home": home, "away": away,
-                "league": league, "SS": score
+                "league": league, "SS": score, "minute": minute, "period": period
             })
 
     logger.info("API live-events: %d match live", len(events))
     return events
 
 # =========================
-# Odds 1X2 (RapidAPI) — ADATTA QUI il parsing a seconda della tua API
+# ODDS: 1X2 + suspended
 # =========================
 def get_event_odds_1x2(event_id: str):
-    """
-    Ritorna dict:
-      {"home": float|None, "draw": float|None, "away": float|None, "suspended": bool|None}
-    """
-    if not event_id:
-        return None
-
+    if not event_id: return None
     params = None
     url = build_url(RAPIDAPI_ODDS_PATH, event_id=event_id)
     if RAPIDAPI_ODDS_QUERY_KEY:
         params = {RAPIDAPI_ODDS_QUERY_KEY: event_id}
 
     r = http_get(url, headers=HEADERS, params=params, timeout=20)
-    if not r or not r.ok:
-        return None
-
-    try:
-        data = r.json() or {}
+    if not r or not r.ok: return None
+    try: data = r.json() or {}
     except Exception:
-        logger.error("Odds non-JSON: %s", r.text[:300]); return None
+        logger.error("odds non-JSON: %s", r.text[:300]); return None
 
-    # esempi possibili:
-    # data = {"markets":[{"key":"1x2","suspended":false,"outcomes":{"home":1.36,"draw":4.50,"away":7.00}}]}
     home = draw = away = None
     suspended = None
 
@@ -272,124 +179,78 @@ def get_event_odds_1x2(event_id: str):
         markets = markets.get("markets") or markets.get("list") or [markets]
 
     pick = None
-    for m in markets:
+    for m in markets or []:
         key = (str(m.get("key") or m.get("name") or m.get("market") or "")).lower()
-        if "1x2" in key or key in ("match_result", "full_time_result", "ft_result", "result"):
-            pick = m
-            break
-    if not pick and markets:
-        # fallback: se la tua API ha un solo mercato quando chiedi 1X2
-        pick = markets[0]
+        if "1x2" in key or key in ("match_result","full_time_result","ft_result","result"):
+            pick = m; break
+    if not pick and markets: pick = markets[0]
 
     if pick:
-        # suspended
-        if "suspended" in pick:
-            suspended = bool(pick.get("suspended"))
-        elif "Suspended" in pick:
-            suspended = bool(pick.get("Suspended"))
-        # outcomes
+        if "suspended" in pick: suspended = bool(pick.get("suspended"))
+        elif "Suspended" in pick: suspended = bool(pick.get("Suspended"))
+
         oc = pick.get("outcomes") or pick.get("runners") or pick.get("outcome") or {}
+        def to_f(x):
+            try: return float(str(x).replace(",", "."))
+            except: return None
+
         if isinstance(oc, dict):
-            home = _to_float(oc.get("home") or oc.get("1") or oc.get("Home") or oc.get("team1"))
-            draw = _to_float(oc.get("draw") or oc.get("X") or oc.get("Draw"))
-            away = _to_float(oc.get("away") or oc.get("2") or oc.get("Away") or oc.get("team2"))
+            home = to_f(oc.get("home") or oc.get("1") or oc.get("Home") or oc.get("team1"))
+            draw = to_f(oc.get("draw") or oc.get("X") or oc.get("Draw"))
+            away = to_f(oc.get("away") or oc.get("2") or oc.get("Away") or oc.get("team2"))
         elif isinstance(oc, list):
             name_map = {}
             for o in oc:
                 name = str(o.get("name") or o.get("selection") or "").lower()
                 price = o.get("price") or o.get("odds") or o.get("decimal") or o.get("Decimal")
-                name_map[name] = _to_float(price)
+                name_map[name] = to_f(price)
             home = name_map.get("home") or name_map.get("1") or name_map.get("team1")
             draw = name_map.get("draw") or name_map.get("x")
             away = name_map.get("away") or name_map.get("2") or name_map.get("team2")
 
     return {"home": home, "draw": draw, "away": away, "suspended": suspended}
 
-def _to_float(x):
-    try:
-        return float(str(x).replace(",", "."))
-    except Exception:
-        return None
-
 # =========================
-# Utils score + minute
-# =========================
-def parse_score_tuple(ss: str) -> tuple[int,int]:
-    if not ss:
-        return (0,0)
-    parts = re.findall(r"\d+", ss)
-    if len(parts) >= 2:
-        try:
-            return (int(parts[0]), int(parts[1]))
-        except Exception:
-            return (0,0)
-    return (0,0)
-
-def detect_scorer(prev: tuple[int,int], cur: tuple[int,int]) -> str | None:
-    ph, pa = prev
-    ch, ca = cur
-    if (ch, ca) == (ph, pa):
-        return None
-    if ch == ph + 1 and ca == pa:
-        return "home"
-    if ca == pa + 1 and ch == ph:
-        return "away"
-    return None  # altro (autogol/correzioni)
-
-# =========================
-# Core
+# Core loop
 # =========================
 def main_loop():
-    logger.info("Bot avviato (logica: quota sale dopo gol entro %d')", MINUTE_CUTOFF)
-    if SEND_STARTUP_MESSAGE:
-        send_telegram_message("🤖 <b>Bot quote avviato</b>\nMonitoraggio anomalie post-gol…")
-
-    csv_rows = load_csv_from_github()
+    send_telegram_message("🤖 <b>Bot Quote Jump avviato</b>\nMonitoraggio live entro 35'…")
 
     while True:
         try:
             live = get_live_matches()
             if not live:
-                time.sleep(CHECK_INTERVAL)
-                continue
+                time.sleep(CHECK_INTERVAL); continue
 
-            # per ogni match live, prova ad agganciare al CSV (per il minuto)
             for lm in live:
-                home, away, league = lm["home"], lm["away"], lm["league"]
-                score_str = lm.get("SS") or ""
-                cur_score = parse_score_tuple(score_str)
+                eid   = lm.get("id") or ""
+                home  = lm.get("home","")
+                away  = lm.get("away","")
+                league= lm.get("league","N/A")
+                score = lm.get("SS") or ""
+                minute= lm.get("minute")  # da API live
+                period= lm.get("period")  # 1 = primo tempo (se disponibile)
 
-                # match CSV
-                minute = None
-                best_csv = None
-                for cm in csv_rows:
-                    if match_teams(cm, lm):
-                        minute = kickoff_minute_from_csv(cm)
-                        best_csv = cm
-                        break
-
-                if minute is None:
-                    # se non riusciamo a stimare il minuto, salta (coerente con la tua base)
-                    if DEBUG_LOG:
-                        logger.info("Minuto non stimato per %s vs %s", home, away)
+                # serve il minuto o almeno il periodo; vogliamo SOLO 1° tempo e <= 35'
+                if minute is not None:
+                    if minute > MINUTE_CUTOFF: 
+                        # chiudi eventuale episodio pendente
+                        st = match_state.get(eid or f"{home}|{away}|{league}")
+                        if st and st.waiting_relist:
+                            st.waiting_relist = False
+                            st.scoring_team = None
+                            st.baseline = None
+                            st.notified = False
+                        continue
+                # se l'API non fornisce minute, lasciamo passare ma filtriamo per period==1
+                if period and int(period) != 1:
                     continue
 
-                # limitiamo ai primi MINUTE_CUTOFF
-                if minute > MINUTE_CUTOFF:
-                    # se c'era uno stato “in attesa” chiudilo senza notifica
-                    key = lm["id"] or f"{home}|{away}|{league}"
-                    st = match_state.get(key)
-                    if st and st.waiting_relist:
-                        st.waiting_relist = False
-                        st.scoring_team = None
-                        st.baseline_odds = None
-                        st.notified = False
-                    continue
-
-                key = lm["id"] or f"{home}|{away}|{league}"
+                cur_score = parse_score_tuple(score)
+                key = eid or f"{home}|{away}|{league}"
                 st = match_state.get(key)
                 if st is None:
-                    st = GoalState(score_tuple=cur_score, minute=minute)
+                    st = GoalState(score=cur_score, period=period or 1)
                     match_state[key] = st
 
                 # 1) rileva gol
@@ -397,62 +258,63 @@ def main_loop():
                 if scorer:
                     st.waiting_relist = True
                     st.scoring_team = scorer
-                    st.baseline_odds = None
+                    st.baseline = None
                     st.notified = False
                     if DEBUG_LOG:
-                        logger.info("GOL %s: %s vs %s (%s) %s", league, home, away, score_str, scorer)
+                        logger.info("GOL %s: %s vs %s | score=%s | period=%s | minute=%s", league, home, away, score, period, minute)
 
                 st.last_score = cur_score
-                st.last_seen_minute = minute
+                st.last_period = period or 1
 
-                # 2) se siamo in attesa di re-listing / baseline / salita
+                # 2) se in attesa di re-listing/baseline/salita
                 if st.waiting_relist:
-                    if not lm.get("id"):
-                        # senza event_id non possiamo interrogare le quote
+                    if not eid:
                         if DEBUG_LOG:
-                            logger.info("Niente event_id → impossibile leggere odds per %s vs %s", home, away)
-                    else:
-                        odds = get_event_odds_1x2(lm["id"])
-                        if odds:
-                            suspended = odds.get("suspended")
-                            # fissa baseline alla prima quota “attiva” dopo il gol
-                            if st.baseline_odds is None:
-                                if suspended is False or suspended is None:
-                                    base = odds["home"] if st.scoring_team == "home" else odds["away"]
-                                    if base is not None:
-                                        st.baseline_odds = base
-                                        if DEBUG_LOG:
-                                            logger.info("Baseline %s: %.2f (%s vs %s)", st.scoring_team, base, home, away)
+                            logger.info("Nessun event_id per %s vs %s: impossibile leggere odds", home, away)
+                        continue
 
-                            # se c'è baseline, controlla una qualsiasi SALITA (> baseline)
-                            if st.baseline_odds is not None and not st.notified:
-                                current = odds["home"] if st.scoring_team == "home" else odds["away"]
-                                if current is not None and current > st.baseline_odds:
-                                    msg = (
-                                        "⚠️ <b>Quota in SALITA dopo il gol</b>\n\n"
-                                        f"🏆 {league}\n"
-                                        f"🏟️ <b>{home}</b> vs <b>{away}</b>\n"
-                                        f"⏱️ <b>{minute}'</b> | Score: <b>{score_str}</b>\n"
-                                        f"⚽ Ha segnato: <b>{home if st.scoring_team=='home' else away}</b>\n"
-                                        f"📈 Quota {('1' if st.scoring_team=='home' else '2')} "
-                                        f"baseline <b>{st.baseline_odds:.2f}</b> → <b>{current:.2f}</b>"
-                                    )
-                                    if send_telegram_message(msg):
-                                        st.notified = True
-                                        st.waiting_relist = False  # chiudi episodio
-                                    else:
-                                        # anche se fallisce l'invio, evita spam continuo
-                                        st.notified = True
-                                        st.waiting_relist = False
+                    odds = get_event_odds_1x2(eid)
+                    if not odds:
+                        continue
 
-                            # se non è salita e superiamo il cutoff, chiudi senza notifica
-                            if st.waiting_relist and minute >= MINUTE_CUTOFF:
-                                st.waiting_relist = False
-                                st.scoring_team = None
-                                st.baseline_odds = None
-                                st.notified = False
+                    suspended = odds.get("suspended")
 
-                # housekeeping: se match sparisce, lo stato verrà sovrascritto nella prossima iterazione
+                    # fissa baseline alla prima quota attiva dopo il gol (anche se suspended mancante)
+                    if st.baseline is None:
+                        if suspended is False or suspended is None:
+                            base = odds["home"] if st.scoring_team == "home" else odds["away"]
+                            if base is not None:
+                                st.baseline = base
+                                if DEBUG_LOG:
+                                    logger.info("Baseline %s: %.2f (%s vs %s)", st.scoring_team, base, home, away)
+
+                    # se c'è baseline, notifica quando la quota SALE di almeno MIN_RISE
+                    if st.baseline is not None and not st.notified:
+                        current = odds["home"] if st.scoring_team == "home" else odds["away"]
+                        if current is not None and current >= st.baseline + MIN_RISE:
+                            msg = (
+                                "⚠️ <b>Quota in SALITA dopo il gol</b>\n\n"
+                                f"🏆 {league}\n"
+                                f"🏟️ <b>{home}</b> vs <b>{away}</b>\n"
+                                f"⏱️ <b>{minute if minute is not None else '1T'}</b> | Score: <b>{score}</b>\n"
+                                f"⚽ Ha segnato: <b>{home if st.scoring_team=='home' else away}</b>\n"
+                                f"📈 Quota {('1' if st.scoring_team=='home' else '2')} "
+                                f"baseline <b>{st.baseline:.2f}</b> → <b>{current:.2f}</b>"
+                            )
+                            send_telegram_message(msg)
+                            st.notified = True
+                            st.waiting_relist = False  # chiudi episodio
+
+                    # se non è salita e abbiamo il minuto > cutoff, chiudi senza notifica
+                    if st.waiting_relist and minute is not None and minute > MINUTE_CUTOFF:
+                        st.waiting_relist = False
+                        st.scoring_team = None
+                        st.baseline = None
+                        st.notified = False
+
+            if DEBUG_LOG:
+                waiting = sum(1 for s in match_state.values() if s.waiting_relist)
+                logger.info("Loop: live=%d | in_attesa_relist=%d", len(live), waiting)
 
             time.sleep(CHECK_INTERVAL)
 
@@ -461,7 +323,7 @@ def main_loop():
             break
         except Exception as e:
             logger.exception("Errore loop: %s", e)
-            time.sleep(10)
+            time.sleep(8)
 
 # =========================
 # Entry
@@ -469,8 +331,7 @@ def main_loop():
 def main():
     if not all([TELEGRAM_TOKEN, CHAT_ID, RAPIDAPI_KEY, RAPIDAPI_HOST]):
         raise SystemExit("Env mancanti: TELEGRAM_TOKEN, CHAT_ID, RAPIDAPI_KEY, RAPIDAPI_HOST")
-
-    logger.info("Start | cutoff=%d' | interval=%ds", MINUTE_CUTOFF, CHECK_INTERVAL)
+    logger.info("Start | cutoff=%d' | min_rise=%.2f | interval=%ds", MINUTE_CUTOFF, MIN_RISE, CHECK_INTERVAL)
     main_loop()
 
 if __name__ == "__main__":
