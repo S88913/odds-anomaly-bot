@@ -30,10 +30,14 @@ RAPIDAPI_EVENTS_PARAMS = dict(parse_qsl(os.getenv("RAPIDAPI_EVENTS_PARAMS", "spo
 RAPIDAPI_ODDS_PATH = os.getenv("RAPIDAPI_ODDS_PATH", "/live-events/{event_id}")
 
 # Business rules
-MINUTE_CUTOFF   = int(os.getenv("MINUTE_CUTOFF", "45"))      # primo tempo completo
-MIN_RISE        = float(os.getenv("MIN_RISE", "0.05"))       # salita minima significativa
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "8"))
+MINUTE_CUTOFF   = int(os.getenv("MINUTE_CUTOFF", "45"))      # TEST: alziamo a 45' per vedere più match
+MIN_RISE        = float(os.getenv("MIN_RISE", "0.00"))       # TEST: 0.00 per vedere qualsiasi variazione
+CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "5"))
 DEBUG_LOG       = os.getenv("DEBUG_LOG", "1") == "1"
+
+# TEST MODE - Forza lettura quote su match già con goal
+TEST_MODE = os.getenv("TEST_MODE", "1") == "1"
+TEST_FORCE_ODDS_ON_EXISTING_GOALS = os.getenv("TEST_FORCE_ODDS", "1") == "1"
 
 # Rate-limit guard
 MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "3"))
@@ -403,15 +407,19 @@ def get_event_odds_1x2(event_id: str, home_name: str, away_name: str, debug_firs
     # Naviga struttura - prova vari percorsi
     root = data.get("data") or data
     
-    # Cerca markets in vari posti
-    markets = (
-        root.get("markets") or 
-        root.get("Markets") or 
-        root.get("odds") or 
-        root.get("bookmakers") or
-        root.get("oddsdata") or
-        []
-    )
+    # Formato Bet365Data: usa "mg" (market groups)
+    markets = root.get("mg") or root.get("MG")
+    
+    # Fallback per altri formati
+    if not markets:
+        markets = (
+            root.get("markets") or 
+            root.get("Markets") or 
+            root.get("odds") or 
+            root.get("bookmakers") or
+            root.get("oddsdata") or
+            []
+        )
     
     if isinstance(markets, dict):
         markets = markets.get("markets") or markets.get("list") or markets.get("items") or [markets]
