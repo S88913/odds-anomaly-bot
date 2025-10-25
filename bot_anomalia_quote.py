@@ -264,11 +264,51 @@ def get_live_matches():
 DRAW_TOKENS = {"draw", "x", "tie", "empate", "remis", "pareggio", "d", "égalité"}
 
 def _extract_1x2_from_market(m, home_name: str, away_name: str):
-    """Estrae quote 1X2 da un mercato"""
-    suspended = m.get("suspended") or m.get("Suspended")
+    """Estrae quote 1X2 da un mercato - supporta formato Bet365Data"""
+    suspended = m.get("suspended") or m.get("Suspended") or m.get("SU")
     if isinstance(suspended, str):
         suspended = suspended.lower() in ("true", "1", "yes", "y")
 
+    # Formato Bet365Data: mg -> ma -> pa
+    ma_list = m.get("ma") or []
+    if ma_list and isinstance(ma_list, list):
+        for ma in ma_list:
+            pa_list = ma.get("pa") or []
+            if not pa_list:
+                continue
+            
+            home_p = away_p = draw_p = None
+            
+            for sel in pa_list:
+                # Prezzo decimale
+                price = parse_price_any(sel.get("decimal") or sel.get("OD"))
+                if price is None:
+                    continue
+                
+                # Identificatori
+                n2 = str(sel.get("N2") or "").strip().upper()
+                label = str(sel.get("NA") or sel.get("name") or "").strip()
+                lname = norm_name(label)
+                
+                # Match per N2 (1, X, 2)
+                if n2 == "1" and home_p is None:
+                    home_p = price
+                elif n2 == "X" and draw_p is None:
+                    draw_p = price
+                elif n2 == "2" and away_p is None:
+                    away_p = price
+                # Match per nome
+                elif lname in DRAW_TOKENS and draw_p is None:
+                    draw_p = price
+                elif home_p is None and fuzzy_contains(label, home_name):
+                    home_p = price
+                elif away_p is None and fuzzy_contains(label, away_name):
+                    away_p = price
+            
+            if any(v is not None for v in (home_p, draw_p, away_p)):
+                return {"home": home_p, "draw": draw_p, "away": away_p, "suspended": bool(suspended)}
+
+    # Formato standard (outcomes/prices)
     outcomes = m.get("outcomes") or m.get("outcome") or m.get("prices") or m.get("selections") or m.get("runners")
 
     # Formato dict: {home: 1.8, draw: 3.5, away: 4.2}
