@@ -31,9 +31,14 @@ RAPIDAPI_ODDS_PATH = os.getenv("RAPIDAPI_ODDS_PATH", "/live-events/{event_id}")
 
 # Business rules
 MINUTE_CUTOFF   = int(os.getenv("MINUTE_CUTOFF", "35"))      # solo primi 35 minuti
-MIN_RISE        = float(os.getenv("MIN_RISE", "0.04"))       # salita minima 0.04 (es: 1.80 → 1.84)
+MIN_RISE        = float(os.getenv("MIN_RISE", "0.04"))       # salita minima 0.04
+BASELINE_MIN    = float(os.getenv("BASELINE_MIN", "1.30"))   # quota minima baseline
+BASELINE_MAX    = float(os.getenv("BASELINE_MAX", "1.90"))   # quota massima baseline
 CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "5"))
 DEBUG_LOG       = os.getenv("DEBUG_LOG", "1") == "1"
+
+# Attesa dopo goal prima di cercare quote (secondi)
+WAIT_AFTER_GOAL_SEC = int(os.getenv("WAIT_AFTER_GOAL_SEC", "45"))
 
 # TEST MODE - Disattivato in produzione
 TEST_MODE = os.getenv("TEST_MODE", "0") == "1"
