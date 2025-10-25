@@ -1,13 +1,4 @@
-# ALERT se quota sale significativamente
-                # IMPORTANTE: Delta deve essere MAGGIORE di MIN_RISE (non uguale)
-                if delta > MIN_RISE and not st.notified:
-                    team_name = home if st.scoring_team == "home" else away
-                    team_label = "1" if st.scoring_team == "home" else "2"
-                    
-                    send_telegram_message(
-                        "🚨 <b>QUOTA IN SALITA!</b>\n\n"
-                        f"🏆 {league}\n"
-                        f"import os
+import os
 import time
 import re
 import unicodedata
@@ -535,18 +526,8 @@ def main_loop():
 
                 # TEST: Forza lettura quote su match già con vantaggio 
                 if TEST_FORCE_ODDS_ON_EXISTING_GOALS and st.goal_detected_at is None:
-                    # Se troviamo un match già 1-0 o 0-1, fai finta sia appena successo
-                    if cur_score == (1, 0) or cur_score == (0, 1):
-                        scorer = "home" if cur_score == (1, 0) else "away"
-                        st.goal_detected_at = now - 46  # Simula che sia passato già il tempo di attesa
-                        st.scoring_team = scorer
-                        st.baseline = None
-                        st.notified = False
-                        st.tries = 0
-                        st.baseline_set_at = None
-                        st.max_seen = None
-                        logger.info("🧪 TEST MODE: Forzo lettura quote per %s vs %s | Score: %d-%d", 
-                                   home, away, cur_score[0], cur_score[1])
+                    # DISATTIVATO - Non forzare più in produzione
+                    pass
 
                 # Rileva PRIMO vantaggio: 0-0 → 1-0 o 0-1
                 first_lead = (prev == (0, 0) and (cur_score == (1, 0) or cur_score == (0, 1)))
@@ -645,6 +626,10 @@ def main_loop():
 
                 # ALERT se quota sale significativamente
                 if delta >= MIN_RISE and not st.notified:
+                    # VERIFICA: Delta deve essere MAGGIORE di zero (non solo >= MIN_RISE se MIN_RISE è 0)
+                    if delta <= 0.001:  # Tolleranza per float
+                        continue
+                    
                     team_name = home if st.scoring_team == "home" else away
                     team_label = "1" if st.scoring_team == "home" else "2"
                     
