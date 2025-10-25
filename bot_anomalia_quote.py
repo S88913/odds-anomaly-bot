@@ -30,14 +30,14 @@ RAPIDAPI_EVENTS_PARAMS = dict(parse_qsl(os.getenv("RAPIDAPI_EVENTS_PARAMS", "spo
 RAPIDAPI_ODDS_PATH = os.getenv("RAPIDAPI_ODDS_PATH", "/live-events/{event_id}")
 
 # Business rules
-MINUTE_CUTOFF   = int(os.getenv("MINUTE_CUTOFF", "45"))      # TEST: alziamo a 45' per vedere più match
-MIN_RISE        = float(os.getenv("MIN_RISE", "0.00"))       # TEST: 0.00 per vedere qualsiasi variazione
+MINUTE_CUTOFF   = int(os.getenv("MINUTE_CUTOFF", "35"))      # solo primi 35 minuti
+MIN_RISE        = float(os.getenv("MIN_RISE", "0.04"))       # salita minima 0.04 (es: 1.80 → 1.84)
 CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "5"))
 DEBUG_LOG       = os.getenv("DEBUG_LOG", "1") == "1"
 
-# TEST MODE - Forza lettura quote su match già con goal
-TEST_MODE = os.getenv("TEST_MODE", "1") == "1"
-TEST_FORCE_ODDS_ON_EXISTING_GOALS = os.getenv("TEST_FORCE_ODDS", "1") == "1"
+# TEST MODE - Disattivato in produzione
+TEST_MODE = os.getenv("TEST_MODE", "0") == "1"
+TEST_FORCE_ODDS_ON_EXISTING_GOALS = os.getenv("TEST_FORCE_ODDS", "0") == "1"
 
 # Rate-limit guard
 MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "3"))
@@ -504,7 +504,14 @@ def main_loop():
                 score = lm.get("SS", "")
                 minute = lm.get("minute")
 
-                # Salta se oltre cutoff
+                # TEST MODE: mostra info dettagliate sui match
+                if TEST_MODE and _loop % 30 == 1:
+                    cur_score = parse_score_tuple(score)
+                    if cur_score != (0, 0):
+                        logger.info("🔍 TEST: %s vs %s | Score: %s | Min: %s | League: %s",
+                                   home, away, score, minute if minute else "?", league)
+
+                # Salta se oltre cutoff (solo se abbiamo il minuto)
                 if minute is not None and minute > MINUTE_CUTOFF:
                     continue
 
@@ -516,6 +523,21 @@ def main_loop():
                     match_state[eid] = st
 
                 prev = st.last_score
+
+                # TEST: Forza lettura quote su match già con vantaggio 
+                if TEST_FORCE_ODDS_ON_EXISTING_GOALS and st.goal_detected_at is None:
+                    # Se troviamo un match già 1-0 o 0-1, fai finta sia appena successo
+                    if cur_score == (1, 0) or cur_score == (0, 1):
+                        scorer = "home" if cur_score == (1, 0) else "away"
+                        st.goal_detected_at = now - 46  # Simula che sia passato già il tempo di attesa
+                        st.scoring_team = scorer
+                        st.baseline = None
+                        st.notified = False
+                        st.tries = 0
+                        st.baseline_set_at = None
+                        st.max_seen = None
+                        logger.info("🧪 TEST MODE: Forzo lettura quote per %s vs %s | Score: %d-%d", 
+                                   home, away, cur_score[0], cur_score[1])
 
                 # Rileva PRIMO vantaggio: 0-0 → 1-0 o 0-1
                 first_lead = (prev == (0, 0) and (cur_score == (1, 0) or cur_score == (0, 1)))
@@ -530,9 +552,9 @@ def main_loop():
                     st.baseline_set_at = None
                     st.max_seen = None
                     
-                    logger.info("⚽ GOAL! %s vs %s | 0-0 → %d-%d | min=%s | %s", 
-                                home, away, cur_score[0], cur_score[1], 
-                                str(minute) if minute else "?", league)
+                    minute_info = f"min={minute}'" if minute else "min=?"
+                    logger.info("⚽ GOAL! %s vs %s | 0-0 → %d-%d | %s | %s", 
+                                home, away, cur_score[0], cur_score[1], minute_info, league)
 
                 st.last_score = cur_score
 
@@ -553,7 +575,7 @@ def main_loop():
                     continue
 
                 # Leggi quote
-                odds = get_event_odds_1x2(eid, home, away, debug_first_call=(st.tries == 1))
+                odds = get_event_odds_1x2(eid, home, away, debug_first_call=(st.tries <= 2))
                 _last_odds_call_ts_ms = int(time.time() * 1000)
                 odds_calls_this_loop += 1
                 st.tries += 1
@@ -568,6 +590,15 @@ def main_loop():
                         logger.warning("❌ Quote non disponibili dopo %d tentativi: %s vs %s", st.tries, home, away)
                         st.notified = True  # Ferma monitoraggio
                     continue
+
+                # LOG: Mostra quote trovate (solo in debug o primi tentativi)
+                if DEBUG_LOG and st.tries <= 3:
+                    logger.info("✅ Quote trovate: %s vs %s | Home=%.2f Draw=%.2f Away=%.2f | Suspended=%s",
+                               home, away, 
+                               odds.get("home") or 0, 
+                               odds.get("draw") or 0, 
+                               odds.get("away") or 0,
+                               odds.get("suspended"))
 
                 # Verifica sospensione
                 if odds.get("suspended"):
@@ -658,13 +689,16 @@ def main():
     logger.info("   • Intervallo check: %ds", CHECK_INTERVAL)
     logger.info("   • Attesa dopo goal: %ds", WAIT_AFTER_GOAL_SEC)
     logger.info("   • Debug: %s", "ON" if DEBUG_LOG else "OFF")
+    if TEST_MODE:
+        logger.info("   • 🧪 TEST MODE: ON")
+        logger.info("   • Force odds on existing goals: %s", "ON" if TEST_FORCE_ODDS_ON_EXISTING_GOALS else "OFF")
     logger.info("="*60)
     
     send_telegram_message(
         "🤖 <b>Bot Quote Jump ATTIVO</b>\n\n"
         "📋 Monitoraggio:\n"
         "• Match 0-0 che vanno in vantaggio\n"
-        "• Solo primo tempo (entro 45')\n"
+        f"• Solo entro {MINUTE_CUTOFF}' (se disponibile)\n"
         f"• Alert se quota sale di almeno {MIN_RISE:.2f}\n\n"
         "✅ Sistema operativo"
     )
