@@ -1,4 +1,13 @@
-import os
+# ALERT se quota sale significativamente
+                # IMPORTANTE: Delta deve essere MAGGIORE di MIN_RISE (non uguale)
+                if delta > MIN_RISE and not st.notified:
+                    team_name = home if st.scoring_team == "home" else away
+                    team_label = "1" if st.scoring_team == "home" else "2"
+                    
+                    send_telegram_message(
+                        "🚨 <b>QUOTA IN SALITA!</b>\n\n"
+                        f"🏆 {league}\n"
+                        f"import os
 import time
 import re
 import unicodedata
