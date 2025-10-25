@@ -1,6 +1,7 @@
 import os
 import time
 import re
+import unicodedata
 import logging
 import requests
 from urllib.parse import parse_qsl
@@ -21,27 +22,26 @@ RAPIDAPI_KEY   = os.getenv("RAPIDAPI_KEY", "")
 RAPIDAPI_HOST  = os.getenv("RAPIDAPI_HOST", "bet365data.p.rapidapi.com")
 RAPIDAPI_BASE  = os.getenv("RAPIDAPI_BASE", f"https://{RAPIDAPI_HOST}")
 
-# LIVE: elenco eventi calcio
+# LIVE list
 RAPIDAPI_EVENTS_PATH   = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
 RAPIDAPI_EVENTS_PARAMS = dict(parse_qsl(os.getenv("RAPIDAPI_EVENTS_PARAMS", "sport=soccer")))
 
-# ODDS: mercati di UN evento (ID nel PATH!) per bet365data
-# es: GET https://bet365data.p.rapidapi.com/live-events/{event_id}
+# ODDS of one event (ID in PATH for bet365data)
 RAPIDAPI_ODDS_PATH      = os.getenv("RAPIDAPI_ODDS_PATH", "/live-events/{event_id}")
-RAPIDAPI_ODDS_QUERY_KEY = os.getenv("RAPIDAPI_ODDS_QUERY_KEY", "")  # lasciare vuoto
+RAPIDAPI_ODDS_QUERY_KEY = os.getenv("RAPIDAPI_ODDS_QUERY_KEY", "")  # leave empty
 
-# Logica
-MINUTE_CUTOFF   = int(os.getenv("MINUTE_CUTOFF", "35"))    # solo entro 35'
-MIN_RISE        = float(os.getenv("MIN_RISE", "0.04"))     # 1.36 -> >= 1.40 con 0.04
+# Business rules
+MINUTE_CUTOFF   = int(os.getenv("MINUTE_CUTOFF", "35"))      # only first 35'
+MIN_RISE        = float(os.getenv("MIN_RISE", "0.04"))       # 1.36 -> >= 1.40 with 0.04
 CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "5"))
-REQUIRE_MINUTE  = os.getenv("REQUIRE_MINUTE", "0") == "1"  # 0 = fallback se minute manca
+REQUIRE_MINUTE  = os.getenv("REQUIRE_MINUTE", "0") == "1"    # many feeds don't send minute in list
 DEBUG_LOG       = os.getenv("DEBUG_LOG", "1") == "1"
 
-# Gialli (diagnostica) — meglio 0 in produzione
+# Diagnostics / goal pings (meglio 0 in produzione)
 LOG_GOAL_DETECTED         = os.getenv("LOG_GOAL_DETECTED", "0") == "1"
 TELEGRAM_ON_GOAL_DETECTED = os.getenv("TELEGRAM_ON_GOAL_DETECTED", "0") == "1"
 
-# Rate limit (per-second)
+# Rate-limit guard
 MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "1"))
 ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "1200"))
 _last_odds_call_ts_ms   = 0
@@ -50,7 +50,7 @@ _last_odds_call_ts_ms   = 0
 COOLDOWN_ON_DAILY_429_MIN = int(os.getenv("COOLDOWN_ON_DAILY_429_MIN", "30"))
 _last_daily_429_ts = 0
 
-# Filtri
+# League filters
 LEAGUE_EXCLUDE_KEYWORDS = [kw.strip().lower() for kw in os.getenv(
     "LEAGUE_EXCLUDE_KEYWORDS", "Esoccer,8 mins,Volta,H2H GG"
 ).split(",") if kw.strip()]
@@ -68,8 +68,8 @@ class GoalState:
         self.scoring_team = None   # "home" | "away"
         self.baseline = None
         self.notified = False
-        self.tries = 0             # quante volte ho letto i mercati in attesa della salita
-        self.last_log_ts = 0       # per non spammare i log
+        self.tries = 0
+        self.last_log_ts = 0
 
 match_state: dict[str, GoalState] = {}
 _loop = 0  # diagnostica snapshot
@@ -120,18 +120,23 @@ def parse_score_tuple(ss: str) -> tuple[int,int]:
         except: return (0,0)
     return (0,0)
 
-def detect_scorer(prev: tuple[int,int], cur: tuple[int,int]) -> str | None:
-    ph, pa = prev; ch, ca = cur
-    if (ch, ca) == (ph, pa): return None
-    if ch == ph + 1 and ca == pa: return "home"
-    if ca == pa + 1 and ch == ph: return "away"
-    return None
+def strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c))
 
-def safe_int_minute(raw_minute):
-    try:
-        return int(str(raw_minute).replace("'", "").replace("’","").strip())
-    except:
-        return None
+def norm_name(s: str) -> str:
+    s = strip_accents(s).lower()
+    s = re.sub(r"[’'`]", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split())
+
+def fuzzy_contains(a: str, b: str) -> bool:
+    # "a" contains "b" tokens (home name inside selection label)
+    A = set(norm_name(a).split())
+    B = set(norm_name(b).split())
+    if not A or not B: return False
+    inter = A & B
+    # richiedi almeno 1 token significativo
+    return len([t for t in inter if len(t) >= 3]) >= 1
 
 # =========================
 # LIVE events
@@ -154,7 +159,6 @@ def get_live_matches():
         league   = (it.get("league") or it.get("CT") or it.get("competition") or "N/A")
         league   = league.strip() if isinstance(league, str) else str(league)
 
-        # Escludi rumorosi
         if any(kw in league.lower() for kw in LEAGUE_EXCLUDE_KEYWORDS):
             continue
 
@@ -162,21 +166,23 @@ def get_live_matches():
         away  = (it.get("away") or it.get("AwayTeam") or it.get("awayTeam") or "").strip()
         score = (it.get("SS") or it.get("score") or "").strip()
 
-        # minute (se il provider non lo manda, resta None)
+        # minute (molti feed lo omettono)
         raw_minute = (
             it.get("minute") or it.get("minutes") or it.get("timeElapsed") or
             it.get("timer") or it.get("clock") or it.get("Clock") or
             it.get("TM") or it.get("T") or it.get("clk")
         )
-        minute = safe_int_minute(raw_minute) if raw_minute is not None else None
+        try:
+            minute = int(str(raw_minute).replace("'", "").replace("’","").strip()) if raw_minute is not None else None
+        except:
+            minute = None
 
-        # molti provider sbagliano "period": non lo usiamo per il trigger
         events.append({
             "id": event_id, "home": home, "away": away,
             "league": league, "SS": score, "minute": minute
         })
 
-    # de-dup (alcuni listati hanno eventi duplicati)
+    # de-dup
     unique = {}
     for e in events:
         k = e.get("id") or f"{e.get('home','')}|{e.get('away','')}|{e.get('league','')}"
@@ -188,56 +194,66 @@ def get_live_matches():
     return events
 
 # =========================
-# ODDS 1X2 (parser robusto)
+# ODDS 1X2 (super-robusto: riconosce anche selezioni col NOME SQUADRA)
 # =========================
-def _extract_1x2_from_market(m):
-    """
-    Prova a ricavare home/draw/away/suspended da un singolo 'market' in vari formati.
-    """
-    name = (str(m.get("key") or m.get("name") or m.get("market") or "")).lower()
+DRAW_TOKENS = {"draw","x","tie","empate","remis","pareggio","d"}
+
+def _extract_price_val(v):
+    for k in ("price","odds","decimal","Decimal","oddsDecimal","odds_eu","value"):
+        if isinstance(v, dict) and k in v:
+            v = v[k]
+    try:
+        return float(str(v).replace(",", "."))
+    except:
+        return None
+
+def _extract_1x2_from_market(m, home_name: str, away_name: str):
     suspended = m.get("suspended")
     if suspended is None:
         suspended = m.get("Suspended")
     if isinstance(suspended, str):
         suspended = suspended.lower() in ("true","1","yes","y")
 
-    # Dizionario outcomes
+    # 1) dizionario outcomes
     oc = m.get("outcomes") or m.get("outcome") or m.get("prices") or m.get("selections")
     if isinstance(oc, dict):
-        def to_f(x):
-            try: return float(str(x).replace(",", "."))
-            except: return None
-        home = to_f(oc.get("home") or oc.get("1") or oc.get("team1") or oc.get("home_win") or oc.get("h"))
-        draw = to_f(oc.get("draw") or oc.get("x") or oc.get("d"))
-        away = to_f(oc.get("away") or oc.get("2") or oc.get("team2") or oc.get("away_win") or oc.get("a"))
-        if home or away or draw:
+        home = _extract_price_val(oc.get("home") or oc.get("1") or oc.get("Home") or oc.get("team1"))
+        draw = _extract_price_val(oc.get("draw") or oc.get("x") or oc.get("X"))
+        away = _extract_price_val(oc.get("away") or oc.get("2") or oc.get("Away") or oc.get("team2"))
+        if any(p is not None for p in (home,draw,away)):
             return {"home": home, "draw": draw, "away": away, "suspended": suspended}
 
-    # Lista di selections/runners
+    # 2) lista selections/runners con etichette arbitrarie (spesso i nomi squadra)
     if isinstance(oc, list):
-        name_map = {}
-        for o in oc:
-            n = (str(o.get("name") or o.get("selection") or o.get("label") or "")).lower()
-            price = o.get("price") or o.get("odds") or o.get("decimal") or o.get("Decimal") \
-                    or o.get("oddsDecimal") or o.get("odds_eu") or o.get("value")
-            try:
-                val = float(str(price).replace(",", "."))
-            except:
-                val = None
-            if n:
-                name_map[n] = val
-        # tante possibili etichette
-        home = name_map.get("home") or name_map.get("1") or name_map.get("team1") \
-               or name_map.get("home win") or name_map.get("1 (home)") or name_map.get("match home")
-        draw = name_map.get("draw") or name_map.get("x") or name_map.get("tie") or name_map.get("pareggio")
-        away = name_map.get("away") or name_map.get("2") or name_map.get("team2") \
-               or name_map.get("away win") or name_map.get("2 (away)") or name_map.get("match away")
-        if home or away or draw:
-            return {"home": home, "draw": draw, "away": away, "suspended": suspended}
+        home_price = draw_price = away_price = None
+        for sel in oc:
+            label = str(sel.get("name") or sel.get("selection") or sel.get("label") or "").strip()
+            lname = norm_name(label)
+            price = _extract_price_val(sel)
+            if not lname:
+                continue
+            if lname in DRAW_TOKENS:
+                draw_price = price if draw_price is None else draw_price
+                continue
+            # match usando i nomi squadra
+            if fuzzy_contains(label, home_name) and home_price is None:
+                home_price = price
+                continue
+            if fuzzy_contains(label, away_name) and away_price is None:
+                away_price = price
+                continue
+            # fallback per simboli
+            if lname in {"1","home","team1"} and home_price is None:
+                home_price = price
+            elif lname in {"2","away","team2"} and away_price is None:
+                away_price = price
+
+        if any(p is not None for p in (home_price,draw_price,away_price)):
+            return {"home": home_price, "draw": draw_price, "away": away_price, "suspended": suspended}
 
     return None
 
-def get_event_odds_1x2(event_id: str):
+def get_event_odds_home_away(event_id: str, home_name: str, away_name: str):
     if not event_id: return None
     url = build_url(RAPIDAPI_ODDS_PATH, event_id=event_id)
     r = http_get(url, headers=HEADERS, timeout=20)
@@ -253,22 +269,20 @@ def get_event_odds_1x2(event_id: str):
     if isinstance(markets, dict):
         markets = markets.get("markets") or markets.get("list") or [markets]
 
-    # 1) cerca un mercato 1X2 per nome
-    pick = None
+    # 1) preferisci mercati il cui nome contiene "result", "winner", "1x2"
+    prioritized = []
+    others = []
     for m in markets or []:
         nm = (str(m.get("key") or m.get("name") or m.get("market") or "")).lower()
-        if "1x2" in nm or "match_result" in nm or "full_time_result" in nm or "ft_result" in nm or nm == "result":
-            pick = m; break
+        if any(tok in nm for tok in ("1x2","match result","full time result","ft result","result","winner","to win")):
+            prioritized.append(m)
+        else:
+            others.append(m)
 
-    # 2) se non trovato, prova a estrarre 1X2 dall'intera lista
-    if pick:
-        out = _extract_1x2_from_market(pick)
-        if out: return out
-    for m in markets or []:
-        out = _extract_1x2_from_market(m)
+    for m in prioritized + others:
+        out = _extract_1x2_from_market(m, home_name, away_name)
         if out: return out
 
-    # 3) non trovato
     return None
 
 # =========================
@@ -320,7 +334,6 @@ def main_loop():
                 else:
                     if minute is not None and minute > MINUTE_CUTOFF:
                         continue
-                    # se minute è None, accettiamo (fallback) pur di non perdere il 1T
 
                 cur_score = parse_score_tuple(score)
                 key = eid or f"{home}|{away}|{league}"
@@ -359,20 +372,19 @@ def main_loop():
                 if not st.waiting_relist or not eid:
                     continue
 
-                # throttle per-secondo
+                # throttle per-second
                 now_ms = int(time.time() * 1000)
                 if odds_calls_this_loop >= MAX_ODDS_CALLS_PER_LOOP or (now_ms - _last_odds_call_ts_ms) < ODDS_CALL_MIN_GAP_MS:
                     continue
 
-                odds = get_event_odds_1x2(eid)
+                odds = get_event_odds_home_away(eid, home, away)
                 _last_odds_call_ts_ms = int(time.time() * 1000)
                 odds_calls_this_loop += 1
                 st.tries += 1
 
                 if not odds:
-                    # log leggero ogni ~20s
                     if DEBUG_LOG and time.time() - st.last_log_ts > 20:
-                        logger.info("No 1X2 market yet: %s vs %s (try=%d)", home, away, st.tries)
+                        logger.info("No 1X2/MatchWinner market yet: %s vs %s (try=%d)", home, away, st.tries)
                         st.last_log_ts = time.time()
                     continue
 
@@ -390,10 +402,6 @@ def main_loop():
                             st.baseline = base
                             if DEBUG_LOG:
                                 logger.info("Baseline %s %s vs %s: %.2f", st.scoring_team, home, away, base)
-                        else:
-                            if DEBUG_LOG and time.time() - st.last_log_ts > 20:
-                                logger.info("No price for %s yet (market present): %s vs %s", st.scoring_team, home, away)
-                                st.last_log_ts = time.time()
                     continue  # aspetta prossimi giri per verificare salita
 
                 # se c'è baseline, verifica salita
@@ -402,7 +410,6 @@ def main_loop():
                     continue
 
                 delta = current - st.baseline
-                # log diagnostico non invadente
                 if DEBUG_LOG and time.time() - st.last_log_ts > 20:
                     logger.info("Track %s vs %s | base=%.2f cur=%.2f delta=%+.2f (try=%d)",
                                 home, away, st.baseline, current, delta, st.tries)
