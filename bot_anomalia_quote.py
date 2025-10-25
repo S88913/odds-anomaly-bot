@@ -323,7 +323,7 @@ def _extract_1x2_from_market(m, home_name: str, away_name: str):
 
     return None
 
-def get_event_odds_1x2(event_id: str, home_name: str, away_name: str):
+def get_event_odds_1x2(event_id: str, home_name: str, away_name: str, debug_first_call=False):
     """Recupera quote 1X2 per un evento"""
     if not event_id:
         return None
@@ -340,25 +340,61 @@ def get_event_odds_1x2(event_id: str, home_name: str, away_name: str):
         logger.error("odds non-JSON per event %s: %s", event_id, r.text[:300])
         return None
 
-    # Naviga struttura
+    # DEBUG: Stampa struttura completa alla prima chiamata
+    if debug_first_call and DEBUG_LOG:
+        import json
+        logger.info("="*60)
+        logger.info("🔍 DEBUG STRUTTURA API per %s vs %s", home_name, away_name)
+        logger.info("Event ID: %s", event_id)
+        logger.info("URL: %s", url)
+        logger.info("-"*60)
+        logger.info("Chiavi root: %s", list(data.keys()))
+        
+        # Mostra primi 2000 caratteri della risposta formattata
+        try:
+            pretty = json.dumps(data, indent=2, ensure_ascii=False)
+            logger.info("Risposta JSON (primi 2000 char):\n%s", pretty[:2000])
+            if len(pretty) > 2000:
+                logger.info("... [troncato, totale %d caratteri]", len(pretty))
+        except:
+            logger.info("Raw data: %s", str(data)[:2000])
+        logger.info("="*60)
+
+    # Naviga struttura - prova vari percorsi
     root = data.get("data") or data
-    markets = root.get("markets") or root.get("Markets") or root.get("odds") or []
+    
+    # Cerca markets in vari posti
+    markets = (
+        root.get("markets") or 
+        root.get("Markets") or 
+        root.get("odds") or 
+        root.get("bookmakers") or
+        root.get("oddsdata") or
+        []
+    )
     
     if isinstance(markets, dict):
-        markets = markets.get("markets") or markets.get("list") or [markets]
+        markets = markets.get("markets") or markets.get("list") or markets.get("items") or [markets]
+
+    if not markets:
+        # Prova a cercare direttamente nelle chiavi
+        if "results" in root:
+            results = root["results"]
+            if isinstance(results, dict) and "markets" in results:
+                markets = results["markets"]
 
     # Mercati prioritari
     priority_keywords = [
         "1x2", "match result", "full time result", "ft result", 
         "result", "winner", "to win", "match odds", "match winner",
-        "resultado final", "3way", "three way", "moneyline"
+        "resultado final", "3way", "three way", "moneyline", "1 x 2"
     ]
     
     prioritized = []
     others = []
     
     for m in markets or []:
-        market_name = str(m.get("key") or m.get("name") or m.get("market") or m.get("title") or "").lower()
+        market_name = str(m.get("key") or m.get("name") or m.get("market") or m.get("title") or m.get("mn") or "").lower()
         
         if any(kw in market_name for kw in priority_keywords):
             prioritized.append(m)
@@ -469,7 +505,7 @@ def main_loop():
                     continue
 
                 # Leggi quote
-                odds = get_event_odds_1x2(eid, home, away)
+                odds = get_event_odds_1x2(eid, home, away, debug_first_call=(st.tries == 1))
                 _last_odds_call_ts_ms = int(time.time() * 1000)
                 odds_calls_this_loop += 1
                 st.tries += 1
