@@ -37,8 +37,8 @@ WAIT_AFTER_GOAL_SEC = int(os.getenv("WAIT_AFTER_GOAL_SEC", "45"))
 DEBUG_LOG       = os.getenv("DEBUG_LOG", "0") == "1"
 
 # Rate limiting
-MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "2"))
-ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "1000"))
+MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "3"))
+ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "800"))
 _last_odds_call_ts_ms   = 0
 
 COOLDOWN_ON_DAILY_429_MIN = int(os.getenv("COOLDOWN_ON_DAILY_429_MIN", "30"))
@@ -56,19 +56,19 @@ HEADERS = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
 class MatchState:
     __slots__ = ("first_seen_at", "first_seen_score", "goal_time", "goal_minute", 
                  "scoring_team", "baseline", "notified", "tries", "rejected_reason",
-                 "last_game_minute")
+                 "minute_captured")
     
     def __init__(self):
         self.first_seen_at = time.time()
         self.first_seen_score = None
         self.goal_time = None
-        self.goal_minute = None  # Minuto REALE del goal
+        self.goal_minute = None  # Minuto REALE del goal catturato subito
         self.scoring_team = None
         self.baseline = None
         self.notified = False
         self.tries = 0
         self.rejected_reason = None
-        self.last_game_minute = None
+        self.minute_captured = False  # Flag per sapere se abbiamo già catturato il minuto
 
 match_state = {}
 _loop = 0
@@ -119,7 +119,6 @@ def parse_score_tuple(ss: str) -> tuple:
 def extract_game_time_from_detail(data: dict) -> int:
     """
     Estrae il minuto reale dal dettaglio evento (endpoint odds).
-    Cerca in vari campi comuni del JSON di risposta.
     """
     root = data.get("data") or data
     
@@ -281,7 +280,6 @@ def extract_1x2(m, home_name: str, away_name: str):
     if isinstance(suspended, str):
         suspended = suspended.lower() in ("true", "1", "yes")
 
-    # Bet365Data format
     ma_list = m.get("ma") or []
     if ma_list:
         for ma in ma_list:
@@ -364,11 +362,22 @@ def get_odds_and_time(event_id: str, home: str, away: str):
 
     return odds, game_minute
 
+def can_call_odds_api():
+    """Verifica se possiamo fare una chiamata all'API delle quote rispettando i rate limits"""
+    global _last_odds_call_ts_ms
+    now_ms = int(time.time() * 1000)
+    return (now_ms - _last_odds_call_ts_ms) >= ODDS_CALL_MIN_GAP_MS
+
+def mark_odds_api_call():
+    """Marca che abbiamo fatto una chiamata all'API"""
+    global _last_odds_call_ts_ms
+    _last_odds_call_ts_ms = int(time.time() * 1000)
+
 # =========================
 # Main Loop
 # =========================
 def main_loop():
-    global _last_daily_429_ts, _last_odds_call_ts_ms, _loop
+    global _last_daily_429_ts, _loop
 
     while True:
         try:
@@ -407,17 +416,16 @@ def main_loop():
 
                 st = match_state[eid]
 
-                # FILTRO 1: Rileva SOLO primo goal 0-0 → 1-0/0-1
+                # STEP 1: Rileva primo goal 0-0 → 1-0/0-1
                 if st.goal_time is None:
                     first_score = st.first_seen_score or (0, 0)
                     
-                    # Deve partire da 0-0
                     if first_score != (0, 0):
                         if not st.rejected_reason:
                             st.rejected_reason = "non_0-0_iniziale"
                         continue
                     
-                    # Primo goal: 0-0 → 1-0 o 0-1
+                    # Primo goal rilevato
                     if cur_score == (1, 0):
                         st.goal_time = now
                         st.scoring_team = "home"
@@ -427,14 +435,42 @@ def main_loop():
                         st.scoring_team = "away"
                         logger.info("⚽ GOAL rilevato: %s vs %s (0-1) | %s", home, away, league)
                     else:
-                        # Score diverso da 0-0, 1-0, 0-1 = NON primo goal
                         if cur_score != (0, 0) and not st.rejected_reason:
                             st.rejected_reason = f"score_invalido_{cur_score[0]}-{cur_score[1]}"
                         continue
 
-                # Da qui in poi: goal rilevato
+                # STEP 2: CATTURA SUBITO IL MINUTO DEL GOAL (priorità assoluta)
+                if st.goal_time is not None and not st.minute_captured:
+                    if can_call_odds_api() and odds_calls < MAX_ODDS_CALLS_PER_LOOP:
+                        _, game_minute = get_odds_and_time(eid, home, away)
+                        mark_odds_api_call()
+                        odds_calls += 1
+                        
+                        if game_minute is not None:
+                            st.goal_minute = game_minute
+                            st.minute_captured = True
+                            logger.info("📍 Minuto goal catturato: %d' per %s vs %s", game_minute, home, away)
+                            
+                            # Verifica immediata: se già oltre cutoff, rifiuta subito
+                            if game_minute > MINUTE_CUTOFF:
+                                st.rejected_reason = f"goal_oltre_{MINUTE_CUTOFF}min"
+                                logger.info("⏭️ Goal oltre %d': %s vs %s (goal al %d')", 
+                                           MINUTE_CUTOFF, home, away, game_minute)
+                                continue
+                        else:
+                            # Fallback: usa il tempo trascorso
+                            fallback_min = int((now - st.first_seen_at) / 60)
+                            st.goal_minute = fallback_min
+                            st.minute_captured = True
+                            logger.warning("⚠️ Minuto non disponibile API, usando fallback: %d' per %s vs %s", 
+                                         fallback_min, home, away)
+                    
+                    # Non procedere fino a quando non abbiamo il minuto
+                    continue
 
-                # FILTRO 2: Verifica che score sia ancora 1-0 o 0-1
+                # Da qui: goal rilevato E minuto catturato
+
+                # STEP 3: Verifica che score sia ancora 1-0 o 0-1
                 expected = (1, 0) if st.scoring_team == "home" else (0, 1)
                 if cur_score != expected:
                     if not st.rejected_reason:
@@ -445,39 +481,27 @@ def main_loop():
                 if st.notified or st.rejected_reason:
                     continue
 
-                # Attesa post-goal
+                # STEP 4: Attesa post-goal
                 if now - st.goal_time < WAIT_AFTER_GOAL_SEC:
                     continue
 
-                # Rate limiting
-                now_ms = int(time.time() * 1000)
-                if odds_calls >= MAX_ODDS_CALLS_PER_LOOP:
-                    continue
-                if (now_ms - _last_odds_call_ts_ms) < ODDS_CALL_MIN_GAP_MS:
+                # STEP 5: Leggi quote e monitora variazione
+                if not can_call_odds_api() or odds_calls >= MAX_ODDS_CALLS_PER_LOOP:
                     continue
 
-                # Leggi quote E tempo di gioco
-                odds, game_minute = get_odds_and_time(eid, home, away)
-                _last_odds_call_ts_ms = now_ms
+                odds, current_minute = get_odds_and_time(eid, home, away)
+                mark_odds_api_call()
                 odds_calls += 1
                 st.tries += 1
 
-                # Salva il minuto di gioco se disponibile
-                if game_minute is not None:
-                    st.last_game_minute = game_minute
-                    # Se non abbiamo ancora salvato il minuto del goal, salvalo ora
-                    if st.goal_minute is None:
-                        st.goal_minute = game_minute
-                        logger.info("📍 Minuto goal registrato: %d' per %s vs %s", game_minute, home, away)
+                # Usa il minuto corrente se disponibile, altrimenti quello del goal
+                display_minute = current_minute if current_minute is not None else st.goal_minute
 
-                # Fallback: usa il tempo dall'inizio del monitoraggio
-                current_minute = st.last_game_minute if st.last_game_minute is not None else int((now - st.first_seen_at) / 60)
-
-                # FILTRO 3: Verifica che siamo entro MINUTE_CUTOFF
-                if current_minute > MINUTE_CUTOFF + 5:
+                # Verifica finale: ancora entro MINUTE_CUTOFF?
+                if display_minute > MINUTE_CUTOFF:
                     st.rejected_reason = f"oltre_{MINUTE_CUTOFF}min"
                     logger.info("⏭️ Match oltre %d': %s vs %s (ora: %d')", 
-                               MINUTE_CUTOFF, home, away, current_minute)
+                               MINUTE_CUTOFF, home, away, display_minute)
                     continue
 
                 if not odds:
@@ -494,7 +518,7 @@ def main_loop():
                 if scorer_price is None:
                     continue
 
-                # FILTRO 4: Range quota 1.30 - 1.90
+                # STEP 6: Range quota 1.30 - 1.90 (baseline)
                 if st.baseline is None:
                     if scorer_price < BASELINE_MIN or scorer_price > BASELINE_MAX:
                         st.rejected_reason = f"quota_{scorer_price:.2f}_fuori_range"
@@ -503,41 +527,31 @@ def main_loop():
                         continue
                     
                     st.baseline = scorer_price
-                    goal_min_display = st.goal_minute if st.goal_minute else "?"
-                    logger.info("✅ Baseline %.2f OK: %s vs %s (goal: %s', ora: %d')", 
-                               scorer_price, home, away, goal_min_display, current_minute)
+                    logger.info("✅ Baseline %.2f OK: %s vs %s (goal: %d', ora: %d')", 
+                               scorer_price, home, away, st.goal_minute, display_minute)
                     continue
 
-                # Monitora variazione
+                # STEP 7: Monitora variazione
                 delta = scorer_price - st.baseline
 
-                # FILTRO 5: Salita minima
                 if delta >= MIN_RISE:
-                    # Verifica finale del minuto
-                    if current_minute > MINUTE_CUTOFF:
-                        st.rejected_reason = f"oltre_{MINUTE_CUTOFF}min_finale"
-                        logger.info("⏭️ Quota salita ma oltre %d': %s vs %s", 
-                                   MINUTE_CUTOFF, home, away)
-                        continue
-                    
                     team_name = home if st.scoring_team == "home" else away
                     team_label = "1" if st.scoring_team == "home" else "2"
                     
-                    goal_min_text = f"{st.goal_minute}'" if st.goal_minute else "?"
-                    
                     send_telegram_message(
-                        f"🚨 <b>QUOTA IN SALITA</b>\n\n"
+                        f"💰💎 <b>MAESTRO VAI Cò MUCILL</b> 💵🤑\n\n"
                         f"🏆 {league}\n"
                         f"⚽ <b>{home}</b> vs <b>{away}</b>\n"
                         f"📊 Score: <b>{cur_score[0]}-{cur_score[1]}</b>\n"
-                        f"⏱️ Goal al: <b>{goal_min_text}</b> | Ora: <b>{current_minute}'</b>\n\n"
-                        f"📈 Quota <b>{team_label}</b> ({team_name}):\n"
-                        f"Base: <b>{st.baseline:.2f}</b> → Attuale: <b>{scorer_price:.2f}</b>\n"
-                        f"Variazione: <b>+{delta:.2f}</b> ({(delta/st.baseline*100):.1f}%)"
+                        f"⏱️ Goal al minuto: <b>{st.goal_minute}'</b>\n\n"
+                        f"💸 Quota <b>{team_label}</b> ({team_name}):\n"
+                        f"<b>{st.baseline:.2f}</b> → <b>{scorer_price:.2f}</b>\n"
+                        f"Salita: <b>+{delta:.2f}</b> ({(delta/st.baseline*100):.1f}%)\n\n"
+                        f"💎💰 OPPORTUNITÀ RILEVATA 💰💎"
                     )
                     
-                    logger.info("✅ ALERT: %s vs %s | %.2f → %.2f (+%.2f) | goal %s ora %d'", 
-                               home, away, st.baseline, scorer_price, delta, goal_min_text, current_minute)
+                    logger.info("✅ ALERT: %s vs %s | %.2f → %.2f (+%.2f) | goal %d' ora %d'", 
+                               home, away, st.baseline, scorer_price, delta, st.goal_minute, display_minute)
                     
                     st.notified = True
 
@@ -563,19 +577,21 @@ def main():
         raise SystemExit("❌ Missing env vars")
     
     logger.info("="*60)
-    logger.info("🚀 BOT QUOTE JUMP - REAL TIME TRACKING v2")
+    logger.info("🚀 BOT QUOTE JUMP - INSTANT GOAL CAPTURE")
     logger.info("="*60)
     logger.info("⚙️  Config:")
     logger.info("   • Max minuti: %d'", MINUTE_CUTOFF)
     logger.info("   • Min rise: +%.2f", MIN_RISE)
     logger.info("   • Quota range: %.2f - %.2f", BASELINE_MIN, BASELINE_MAX)
+    logger.info("   • Wait after goal: %ds", WAIT_AFTER_GOAL_SEC)
     logger.info("   • Check: %ds", CHECK_INTERVAL)
     logger.info("="*60)
     
     send_telegram_message(
-        f"🤖 <b>Bot ATTIVO - Tempo Reale v2</b>\n\n"
+        f"🤖 <b>Bot ATTIVO - Instant Capture</b>\n\n"
         f"✅ Solo <b>0-0 → 1-0/0-1</b>\n"
-        f"✅ Solo entro <b>{MINUTE_CUTOFF}'</b> (tempo reale)\n"
+        f"✅ Cattura minuto <b>SUBITO</b>\n"
+        f"✅ Max <b>{MINUTE_CUTOFF}'</b>\n"
         f"✅ Quote <b>{BASELINE_MIN:.2f}-{BASELINE_MAX:.2f}</b>\n"
         f"✅ Rise <b>+{MIN_RISE:.2f}</b>"
     )
