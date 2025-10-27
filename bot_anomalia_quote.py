@@ -1,554 +1,291 @@
-import os
-import time
-import re
-import unicodedata
-import logging
-import requests
-from urllib.parse import parse_qsl
-from datetime import datetime
+#!/usr/bin/env python3
 
-# =========================
-# Logging
-# =========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("quote-jump-bot")
+-- coding: utf-8 --
 
-# =========================
-# Environment
-# =========================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID        = os.getenv("CHAT_ID", "")
+""" Bot Quote Jump – First-Half Only
 
-RAPIDAPI_KEY   = os.getenv("RAPIDAPI_KEY", "")
-RAPIDAPI_HOST  = os.getenv("RAPIDAPI_HOST", "bet365data.p.rapidapi.com")
-RAPIDAPI_BASE  = f"https://{RAPIDAPI_HOST}"
+Requisiti richiesti:
 
-RAPIDAPI_EVENTS_PATH   = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
-RAPIDAPI_EVENTS_PARAMS = dict(parse_qsl(os.getenv("RAPIDAPI_EVENTS_PARAMS", "sport=soccer")))
-RAPIDAPI_ODDS_PATH = os.getenv("RAPIDAPI_ODDS_PATH", "/live-events/{event_id}")
+Considera SOLO il primo gol del match: transizione 0-0 -> 1-0 oppure 0-1.
 
-# Business rules - FILTRI STRETTI
-MINUTE_CUTOFF   = int(os.getenv("MINUTE_CUTOFF", "35"))
-MIN_RISE        = float(os.getenv("MIN_RISE", "0.04"))
-BASELINE_MIN    = float(os.getenv("BASELINE_MIN", "1.30"))
-BASELINE_MAX    = float(os.getenv("BASELINE_MAX", "1.90"))
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "8"))
-WAIT_AFTER_GOAL_SEC = int(os.getenv("WAIT_AFTER_GOAL_SEC", "45"))
-DEBUG_LOG       = os.getenv("DEBUG_LOG", "0") == "1"
+Ignora il minuto preciso: basta sapere se l'evento è nel PRIMO TEMPO.
 
-# Rate limiting
-MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "2"))
-ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "1000"))
-_last_odds_call_ts_ms   = 0
+Accetta la baseline soltanto se la quota del team che ha segnato è nel range 1.30–1.90 subito dopo il gol.
 
-COOLDOWN_ON_DAILY_429_MIN = int(os.getenv("COOLDOWN_ON_DAILY_429_MIN", "30"))
-_last_daily_429_ts = 0
+Notifica solo se, DOPO la baseline, la quota AUMENTA (anche di poco – soglia configurabile MIN_RISE).
 
-LEAGUE_EXCLUDE_KEYWORDS = [kw.strip().lower() for kw in os.getenv(
-    "LEAGUE_EXCLUDE_KEYWORDS", "Esoccer,8 mins,Volta,H2H GG,Virtual"
-).split(",") if kw.strip()]
+Se l'evento non è nel primo tempo, scarta.
 
-HEADERS = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
+Correzioni/fix: robustezza chiavi odds, fairness tra match, cleanup veloce post notifica/rifiuto, gestione suspended, throttling, logging migliorato, uso orologio monotono per differenze.
 
-# =========================
-# Stato match
-# =========================
-class MatchState:
-    __slots__ = ("first_seen_at", "first_seen_score", "goal_time", "goal_minute", 
-                 "scoring_team", "baseline", "notified", "tries", "rejected_reason")
-    
-    def __init__(self):
-        self.first_seen_at = time.time()
-        self.first_seen_score = None
-        self.goal_time = None
-        self.goal_minute = None  # Minuto REALE del goal
-        self.scoring_team = None
-        self.baseline = None
-        self.notified = False
-        self.tries = 0
-        self.rejected_reason = None
 
-match_state = {}
-_loop = 0
+NOTE IMPORTANTI:
 
-# =========================
-# Helpers
-# =========================
-def send_telegram_message(message: str) -> bool:
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=15)
-        return bool(r and r.ok)
-    except Exception as e:
-        logger.exception("Telegram error: %s", e)
-        return False
+Le funzioni di integrazione API get_odds_and_phase, can_call_odds_api, mark_odds_api_call, send_telegram_message, e il feed partite iter_live_matches() sono DA IMPLEMENTARE in base al provider (RapidAPI o altro). Il core della logica è completo e pronto. """
 
-def http_get(url, headers=None, params=None, timeout=25):
-    global _last_daily_429_ts
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=timeout)
-        if r.status_code == 429:
-            if "daily" in (r.text or "").lower():
-                _last_daily_429_ts = int(time.time())
-                logger.error("HTTP 429 DAILY QUOTA")
-        elif not r.ok:
-            logger.error("HTTP %s %s", r.status_code, url)
-        return r
-    except Exception as e:
-        logger.error("HTTP error: %s", e)
-        return None
 
-def build_url(path: str, **fmt):
-    return f"{RAPIDAPI_BASE.rstrip('/')}/{path.format(**fmt).lstrip('/')}"
+from future import annotations import os import time import random import logging from dataclasses import dataclass, field from typing import Dict, Optional, Tuple, Iterable
 
-def parse_score_tuple(ss: str) -> tuple:
-    if not ss:
-        return (0, 0)
-    nums = re.findall(r"\d+", ss)
-    if len(nums) >= 2:
-        try:
-            return (int(nums[0]), int(nums[1]))
-        except:
-            return (0, 0)
-    return (0, 0)
+=========================
 
-def extract_game_time(event: dict) -> int:
-    """
-    Estrae il minuto reale di gioco dall'evento.
-    Campi comuni: Tr (time remaining), Eps (elapsed seconds), etc.
-    """
-    # Prova diversi campi comuni per il tempo di gioco
-    
-    # Campo Tr (es: "12'" o "12")
-    tr = event.get("Tr") or event.get("TR") or event.get("tr")
-    if tr:
-        tr_str = str(tr).strip().replace("'", "").replace("+", "")
-        match = re.search(r"(\d+)", tr_str)
-        if match:
-            try:
-                return int(match.group(1))
-            except:
-                pass
-    
-    # Campo Eps (elapsed seconds)
-    eps = event.get("Eps") or event.get("EPS") or event.get("eps")
-    if eps:
-        try:
-            return int(float(eps) // 60)
-        except:
-            pass
-    
-    # Campo time o matchTime
-    match_time = event.get("time") or event.get("matchTime") or event.get("Time")
-    if match_time:
-        time_str = str(match_time).strip().replace("'", "")
-        match = re.search(r"(\d+)", time_str)
-        if match:
-            try:
-                return int(match.group(1))
-            except:
-                pass
-    
-    # Fallback: calcola dalla prima volta che vediamo il match
-    return None
+Config
 
-def strip_accents(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c))
+=========================
 
-def norm_name(s: str) -> str:
-    s = strip_accents(s).lower()
-    s = re.sub(r"[''`]", " ", s)
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    return " ".join(s.split())
+MIN_RISE: float = 0.05          # incremento minimo assoluto per notificare (es. +0.05) BASELINE_MIN: float = 1.30 BASELINE_MAX: float = 1.90 WAIT_AFTER_GOAL_SEC: int = 8     # tempo minimo post-gol prima di iniziare a cercare la salita CHECK_INTERVAL: float = 1.0      # sleep tra loop MAX_ODDS_CALLS_PER_LOOP: int = 30 SUSPENDED_MAX_TRIES: int = 12    # oltre questo numero di letture "suspended" rifiuta CLEANUP_GRACE_SEC: int = 90      # quanto tenere lo stato dopo notified/rejected STATE_HARD_TTL_SEC: int = 7200   # 2 ore hard TTL
 
-def fuzzy_contains(a: str, b: str) -> bool:
-    A = set(norm_name(a).split())
-    B = set(norm_name(b).split())
-    if not A or not B:
-        return False
-    inter = A & B
-    return len([t for t in inter if len(t) >= 3]) >= 1
+=========================
 
-def parse_price_any(x):
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        val = float(x)
-        return val if 1.01 <= val <= 1000 else None
-    
-    s = str(x).strip()
-    try:
-        val = float(s.replace(",", "."))
-        return val if 1.01 <= val <= 1000 else None
-    except:
-        pass
-    
-    if "/" in s:
-        try:
-            a, b = s.split("/", 1)
-            a, b = float(a.strip()), float(b.strip())
-            if b != 0:
-                val = 1.0 + (a / b)
-                return val if 1.01 <= val <= 1000 else None
-        except:
-            pass
-    
-    if s.startswith("+") or s.startswith("-"):
-        try:
-            n = int(s)
-            val = 1.0 + (n / 100.0) if n > 0 else 1.0 + (100.0 / abs(n))
-            return val if 1.01 <= val <= 1000 else None
-        except:
-            pass
-    
-    return None
+Env
 
-# =========================
-# API
-# =========================
-def get_live_matches():
-    url = build_url(RAPIDAPI_EVENTS_PATH)
-    r = http_get(url, headers=HEADERS, params=RAPIDAPI_EVENTS_PARAMS, timeout=25)
-    if not r or not r.ok:
-        return []
+=========================
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") CHAT_ID = os.getenv("CHAT_ID") RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+
+=========================
+
+Logging
+
+=========================
+
+logging.basicConfig( level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", ) logger = logging.getLogger("quote_jump_firsthalf")
+
+=========================
+
+State
+
+=========================
+
+@dataclass class MatchState: eid: str home: str away: str league: str
+
+first_seen_at: float = field(default_factory=time.time)
+first_seen_score: Optional[Tuple[int, int]] = None
+
+goal_time_wall: Optional[float] = None  # time.time() al gol
+scoring_team: Optional[str] = None      # "home" / "away"
+half_at_goal: Optional[int] = None      # 1 o 2
+
+baseline: Optional[float] = None
+baseline_set_at: Optional[float] = None
+
+notified: bool = False
+rejected_reason: Optional[str] = None
+to_remove_at: Optional[float] = None
+
+tries: int = 0
+suspended_tries: int = 0
+last_odds_check_ts: float = 0.0
+
+=========================
+
+Provider adapters (DA IMPLEMENTARE)
+
+=========================
+
+def iter_live_matches() -> Iterable[Tuple[str,str,str,str,Tuple[int,int]]]: """Yield di partite live presenti nel feed. Deve restituire tuple: (eid, home, away, league, cur_score) Esempio cur_score: (1,0) """ raise NotImplementedError
+
+def get_odds_and_phase(eid: str, home: str, away: str) -> Tuple[Optional[Dict[str, float]], Optional[int]]: """Ritorna (odds_dict, half) - odds_dict: {"home": float|None, "away": float|None, "suspended": bool} - half: 1, 2 oppure None se non disponibile """ raise NotImplementedError
+
+def can_call_odds_api() -> bool: return True
+
+def mark_odds_api_call() -> None: pass
+
+def send_telegram_message(html_text: str) -> None: """Invia HTML su Telegram. Da implementare con requests se necessario. """ logger.info("TELEGRAM >> %s", html_text.replace("\n", " | "))
+
+=========================
+
+Core logic
+
+=========================
+
+def main_loop() -> None: match_state: Dict[str, MatchState] = {}
+
+while True:
+    now = time.time()
+    odds_calls = 0
 
     try:
-        data = r.json() or {}
-    except:
-        logger.error("Non-JSON response")
-        return []
+        # Fairness: itera le partite in ordine random
+        matches = list(iter_live_matches())
+        random.shuffle(matches)
 
-    raw = (data.get("data") or {}).get("events") or data.get("events") or []
-    events = []
+        for eid, home, away, league, cur_score in matches:
+            st = match_state.get(eid)
+            if st is None:
+                st = MatchState(eid=eid, home=home, away=away, league=league, first_seen_score=cur_score)
+                match_state[eid] = st
 
-    for it in raw:
-        event_id = str(it.get("id") or it.get("event_id") or it.get("EId") or "")
-        league = (it.get("league") or it.get("CT") or "N/A").strip()
-        
-        if any(kw in league.lower() for kw in LEAGUE_EXCLUDE_KEYWORDS):
-            continue
-
-        home = (it.get("home") or it.get("HomeTeam") or "").strip()
-        away = (it.get("away") or it.get("AwayTeam") or "").strip()
-        score = (it.get("SS") or "").strip()
-        game_time = extract_game_time(it)
-
-        if not home or not away or not event_id:
-            continue
-
-        events.append({
-            "id": event_id,
-            "home": home,
-            "away": away,
-            "league": league,
-            "score": score,
-            "game_time": game_time,
-            "raw": it  # Conserva i dati raw per debug
-        })
-
-    unique = {}
-    for e in events:
-        if e["id"] not in unique:
-            unique[e["id"]] = e
-    
-    return list(unique.values())
-
-DRAW_TOKENS = {"draw", "x", "tie", "empate", "remis", "pareggio", "d", "égalité"}
-
-def extract_1x2(m, home_name: str, away_name: str):
-    suspended = m.get("suspended") or m.get("SU")
-    if isinstance(suspended, str):
-        suspended = suspended.lower() in ("true", "1", "yes")
-
-    # Bet365Data format
-    ma_list = m.get("ma") or []
-    if ma_list:
-        for ma in ma_list:
-            pa_list = ma.get("pa") or []
-            if not pa_list:
-                continue
-            
-            home_p = away_p = draw_p = None
-            
-            for sel in pa_list:
-                price = parse_price_any(sel.get("decimal") or sel.get("OD"))
-                if not price:
-                    continue
-                
-                n2 = str(sel.get("N2") or "").strip().upper()
-                label = str(sel.get("NA") or "").strip()
-                lname = norm_name(label)
-                
-                if n2 == "1" and home_p is None:
-                    home_p = price
-                elif n2 == "X" and draw_p is None:
-                    draw_p = price
-                elif n2 == "2" and away_p is None:
-                    away_p = price
-                elif lname in DRAW_TOKENS and draw_p is None:
-                    draw_p = price
-                elif home_p is None and fuzzy_contains(label, home_name):
-                    home_p = price
-                elif away_p is None and fuzzy_contains(label, away_name):
-                    away_p = price
-            
-            if any(v is not None for v in (home_p, draw_p, away_p)):
-                return {"home": home_p, "draw": draw_p, "away": away_p, "suspended": bool(suspended)}
-
-    return None
-
-def get_odds_1x2(event_id: str, home: str, away: str):
-    if not event_id:
-        return None
-        
-    url = build_url(RAPIDAPI_ODDS_PATH, event_id=event_id)
-    r = http_get(url, headers=HEADERS, timeout=20)
-    
-    if not r or not r.ok:
-        return None
-
-    try:
-        data = r.json() or {}
-    except:
-        return None
-
-    root = data.get("data") or data
-    markets = root.get("mg") or []
-    
-    priority_kw = ["fulltime result", "match result", "1x2", "ft result"]
-    prioritized = []
-    others = []
-    
-    for m in markets or []:
-        name = str(m.get("name") or "").lower()
-        if any(kw in name for kw in priority_kw):
-            prioritized.append(m)
-        else:
-            others.append(m)
-
-    for m in prioritized + others:
-        result = extract_1x2(m, home, away)
-        if result:
-            return result
-
-    return None
-
-# =========================
-# Main Loop
-# =========================
-def main_loop():
-    global _last_daily_429_ts, _last_odds_call_ts_ms, _loop
-
-    while True:
-        try:
-            # Daily 429 cooldown
-            if _last_daily_429_ts:
-                elapsed = int(time.time()) - _last_daily_429_ts
-                if elapsed < COOLDOWN_ON_DAILY_429_MIN * 60:
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-                _last_daily_429_ts = 0
-
-            live = get_live_matches()
-            if not live:
-                time.sleep(CHECK_INTERVAL)
+            # Se già notificato o rifiutato, aspetta il cleanup
+            if st.notified or st.rejected_reason:
+                if st.to_remove_at and now >= st.to_remove_at:
+                    del match_state[eid]
                 continue
 
-            _loop += 1
-            if _loop % 40 == 1:
-                logger.info("📊 Monitoring %d live matches", len(live))
+            # STEP 1: verifica transizione primo gol 0-0 -> 1-0 / 0-1
+            if st.goal_time_wall is None:
+                first_score = st.first_seen_score or (0, 0)
+                if first_score != (0, 0):
+                    st.rejected_reason = "non_0-0_iniziale"
+                    st.to_remove_at = now + CLEANUP_GRACE_SEC
+                    continue
 
-            now = time.time()
-            odds_calls = 0
-
-            for match in live:
-                eid = match["id"]
-                home = match["home"]
-                away = match["away"]
-                league = match["league"]
-                score = match["score"]
-                game_time = match["game_time"]
-                cur_score = parse_score_tuple(score)
-
-                # Inizializza stato
-                if eid not in match_state:
-                    match_state[eid] = MatchState()
-                    match_state[eid].first_seen_score = cur_score
-
-                st = match_state[eid]
-
-                # Se abbiamo il tempo reale, usalo. Altrimenti fallback al calcolo
-                if game_time is not None:
-                    current_minute = game_time
+                if cur_score == (1, 0):
+                    st.goal_time_wall = now
+                    st.scoring_team = "home"
+                    logger.info("⚽ Primo goal rilevato: %s vs %s (1-0) | %s | eid=%s", home, away, league, eid)
+                elif cur_score == (0, 1):
+                    st.goal_time_wall = now
+                    st.scoring_team = "away"
+                    logger.info("⚽ Primo goal rilevato: %s vs %s (0-1) | %s | eid=%s", home, away, league, eid)
                 else:
-                    elapsed_sec = time.time() - st.first_seen_at
-                    current_minute = int(elapsed_sec // 60)
-
-                # FILTRO 1: Scarta se oltre MINUTE_CUTOFF + margine
-                if current_minute > MINUTE_CUTOFF + 5:
-                    if not st.rejected_reason:
-                        st.rejected_reason = f"oltre_{MINUTE_CUTOFF}min"
+                    # score invalido per primo goal
+                    if cur_score != (0, 0):
+                        st.rejected_reason = f"score_invalido_{cur_score[0]}-{cur_score[1]}"
+                        st.to_remove_at = now + CLEANUP_GRACE_SEC
                     continue
 
-                # FILTRO 2: Rileva SOLO primo goal 0-0 → 1-0/0-1
-                if st.goal_time is None:
-                    first_score = st.first_seen_score or (0, 0)
-                    
-                    # Deve partire da 0-0
-                    if first_score != (0, 0):
-                        if not st.rejected_reason:
-                            st.rejected_reason = "non_0-0_iniziale"
-                        continue
-                    
-                    # Primo goal: 0-0 → 1-0 o 0-1
-                    if cur_score == (1, 0):
-                        st.goal_time = now
-                        st.goal_minute = current_minute
-                        st.scoring_team = "home"
-                        logger.info("⚽ GOAL %d': %s vs %s (1-0) | %s", 
-                                   current_minute, home, away, league)
-                    elif cur_score == (0, 1):
-                        st.goal_time = now
-                        st.goal_minute = current_minute
-                        st.scoring_team = "away"
-                        logger.info("⚽ GOAL %d': %s vs %s (0-1) | %s", 
-                                   current_minute, home, away, league)
-                    else:
-                        # Score diverso da 0-0, 1-0, 0-1 = NON primo goal
-                        if cur_score != (0, 0) and not st.rejected_reason:
-                            st.rejected_reason = f"score_invalido_{cur_score[0]}-{cur_score[1]}"
-                        continue
+            # Da qui: goal rilevato
 
-                # Da qui in poi: goal rilevato
+            # STEP 2: accertati che siamo nel PRIMO TEMPO
+            if not can_call_odds_api() or odds_calls >= MAX_ODDS_CALLS_PER_LOOP:
+                continue
+            odds, half = get_odds_and_phase(eid, home, away)
+            mark_odds_api_call(); odds_calls += 1
+            st.tries += 1
 
-                # FILTRO 3: Verifica che score sia ancora 1-0 o 0-1
-                expected = (1, 0) if st.scoring_team == "home" else (0, 1)
-                if cur_score != expected:
-                    if not st.rejected_reason:
-                        st.rejected_reason = f"score_cambiato_a_{cur_score[0]}-{cur_score[1]}"
+            if half is None:
+                # se il provider non dice l'half, riprova al giro successivo
+                continue
+            if half != 1:
+                st.rejected_reason = "non_primo_tempo"
+                st.to_remove_at = now + CLEANUP_GRACE_SEC
+                logger.info("⏭️ Goal NON nel primo tempo: %s vs %s | half=%s | eid=%s", home, away, half, eid)
+                continue
+
+            # STEP 3: attesa breve post-gol prima di iniziare la baseline
+            if now - st.goal_time_wall < WAIT_AFTER_GOAL_SEC:
+                continue
+
+            # STEP 4: lettura quote valida e baseline in range
+            if not odds:
+                if st.tries > 30:
+                    st.rejected_reason = "no_odds_30_tries"
+                    st.to_remove_at = now + CLEANUP_GRACE_SEC
+                    logger.warning("❌ No odds after 30 tries: %s vs %s | eid=%s", home, away, eid)
+                continue
+
+            if odds.get("suspended"):
+                st.suspended_tries += 1
+                if st.suspended_tries > SUSPENDED_MAX_TRIES:
+                    st.rejected_reason = "suspended_too_long"
+                    st.to_remove_at = now + CLEANUP_GRACE_SEC
+                continue
+
+            price = odds.get("home") if st.scoring_team == "home" else odds.get("away")
+            if not isinstance(price, (int, float)):
+                continue
+
+            # se non abbiamo baseline, impostala se nel range
+            if st.baseline is None:
+                if not (BASELINE_MIN <= price <= BASELINE_MAX):
+                    st.rejected_reason = f"quota_{price:.2f}_fuori_range"
+                    st.to_remove_at = now + CLEANUP_GRACE_SEC
+                    logger.info("❌ Baseline fuori range [%.2f-%.2f]: %.2f | %s vs %s | eid=%s",
+                                BASELINE_MIN, BASELINE_MAX, price, home, away, eid)
                     continue
+                st.baseline = float(price)
+                st.baseline_set_at = now
+                logger.info("✅ Baseline %.2f impostata | %s vs %s | scorer=%s | eid=%s",
+                            st.baseline, home, away, st.scoring_team, eid)
+                continue  # dal prossimo giro iniziamo a cercare la salita
 
-                # Già notificato o rifiutato
-                if st.notified or st.rejected_reason:
-                    continue
+            # STEP 5: monitoraggio salita nel primo tempo
+            if half != 1:
+                st.rejected_reason = "half_changed_to_2"
+                st.to_remove_at = now + CLEANUP_GRACE_SEC
+                continue
 
-                # Attesa post-goal
-                if now - st.goal_time < WAIT_AFTER_GOAL_SEC:
-                    continue
+            delta = price - st.baseline
+            if delta >= MIN_RISE:
+                team_name = st.home if st.scoring_team == "home" else st.away
+                team_label = "1" if st.scoring_team == "home" else "2"
 
-                # FILTRO 4: Verifica che siamo ancora entro MINUTE_CUTOFF
-                if current_minute > MINUTE_CUTOFF:
-                    st.rejected_reason = f"oltre_{MINUTE_CUTOFF}min"
-                    logger.info("⏭️ Match oltre %d': %s vs %s (goal al %d')", 
-                               MINUTE_CUTOFF, home, away, st.goal_minute)
-                    continue
-
-                # Rate limiting
-                now_ms = int(time.time() * 1000)
-                if odds_calls >= MAX_ODDS_CALLS_PER_LOOP:
-                    continue
-                if (now_ms - _last_odds_call_ts_ms) < ODDS_CALL_MIN_GAP_MS:
-                    continue
-
-                # Leggi quote
-                odds = get_odds_1x2(eid, home, away)
-                _last_odds_call_ts_ms = now_ms
-                odds_calls += 1
-                st.tries += 1
-
-                if not odds:
-                    if st.tries > 30:
-                        st.rejected_reason = "no_odds_30_tries"
-                        logger.warning("❌ No odds after 30 tries: %s vs %s", home, away)
-                    continue
-
-                if odds.get("suspended"):
-                    continue
-
-                scorer_price = odds["home"] if st.scoring_team == "home" else odds["away"]
-                
-                if scorer_price is None:
-                    continue
-
-                # FILTRO 5: Range quota 1.30 - 1.90
-                if st.baseline is None:
-                    if scorer_price < BASELINE_MIN or scorer_price > BASELINE_MAX:
-                        st.rejected_reason = f"quota_{scorer_price:.2f}_fuori_range"
-                        logger.info("❌ Quota %.2f fuori range [%.2f-%.2f]: %s vs %s", 
-                                   scorer_price, BASELINE_MIN, BASELINE_MAX, home, away)
-                        continue
-                    
-                    st.baseline = scorer_price
-                    logger.info("✅ Baseline %.2f OK: %s vs %s (goal al %d', ora %d')", 
-                               scorer_price, home, away, st.goal_minute, current_minute)
-                    continue
-
-                # Monitora variazione
-                delta = scorer_price - st.baseline
-
-                # FILTRO 6: Salita minima
-                if delta >= MIN_RISE:
-                    team_name = home if st.scoring_team == "home" else away
-                    team_label = "1" if st.scoring_team == "home" else "2"
-                    
-                    send_telegram_message(
-                        f"🚨 <b>QUOTA IN SALITA</b>\n\n"
-                        f"🏆 {league}\n"
-                        f"⚽ <b>{home}</b> vs <b>{away}</b>\n"
+                send_telegram_message(
+                    (
+                        f"💰💎 <b>OPPORTUNITÀ QUOTA – PRIMO TEMPO</b>\n\n"
+                        f"🏆 {st.league}\n"
+                        f"⚽ <b>{st.home}</b> vs <b>{st.away}</b>\n"
                         f"📊 Score: <b>{cur_score[0]}-{cur_score[1]}</b>\n"
-                        f"⏱️ Goal al: <b>{st.goal_minute}'</b> | Ora: <b>{current_minute}'</b>\n\n"
-                        f"📈 Quota <b>{team_label}</b> ({team_name}):\n"
-                        f"Base: <b>{st.baseline:.2f}</b> → Attuale: <b>{scorer_price:.2f}</b>\n"
-                        f"Variazione: <b>+{delta:.2f}</b> ({(delta/st.baseline*100):.1f}%)"
+                        f"⏱️ Tempo: <b>1°</b>\n\n"
+                        f"💸 Quota <b>{team_label}</b> ({team_name}):\n"
+                        f"<b>{st.baseline:.2f}</b> → <b>{price:.2f}</b>\n"
+                        f"Salita: <b>+{delta:.2f}</b>\n\n"
+                        f"💎💰 NOTIFICA ATTIVA (solo 1° tempo) 💰💎"
                     )
-                    
-                    logger.info("✅ ALERT: %s vs %s | %.2f → %.2f (+%.2f) | goal %d' ora %d'", 
-                               home, away, st.baseline, scorer_price, delta, st.goal_minute, current_minute)
-                    
-                    st.notified = True
+                )
 
-            # Pulizia stati vecchi (>2 ore)
-            to_remove = [k for k, v in match_state.items() if (now - v.first_seen_at) > 7200]
-            for k in to_remove:
-                del match_state[k]
+                logger.info("✅ ALERT: %s vs %s | %.2f → %.2f (+%.2f) | scorer=%s | eid=%s",
+                            home, away, st.baseline, price, delta, st.scoring_team, eid)
 
-            time.sleep(CHECK_INTERVAL)
+                st.notified = True
+                st.to_remove_at = now + CLEANUP_GRACE_SEC
+                continue
 
-        except KeyboardInterrupt:
-            logger.info("🛑 Stop")
-            break
-        except Exception as e:
-            logger.exception("Error: %s", e)
-            time.sleep(10)
+            # Protezione: se lo score non è più quello del primo gol e non abbiamo ancora notificato, rifiuta
+            expected = (1, 0) if st.scoring_team == "home" else (0, 1)
+            if cur_score != expected and st.baseline is not None:
+                st.rejected_reason = f"score_cambiato_a_{cur_score[0]}-{cur_score[1]}"
+                st.to_remove_at = now + CLEANUP_GRACE_SEC
+                continue
 
-# =========================
-# Start
-# =========================
-def main():
-    if not all([TELEGRAM_TOKEN, CHAT_ID, RAPIDAPI_KEY]):
-        raise SystemExit("❌ Missing env vars")
-    
-    logger.info("="*60)
-    logger.info("🚀 BOT QUOTE JUMP - REAL TIME TRACKING")
-    logger.info("="*60)
-    logger.info("⚙️  Config:")
-    logger.info("   • Max minuti: %d'", MINUTE_CUTOFF)
-    logger.info("   • Min rise: +%.2f", MIN_RISE)
-    logger.info("   • Quota range: %.2f - %.2f", BASELINE_MIN, BASELINE_MAX)
-    logger.info("   • Check: %ds", CHECK_INTERVAL)
-    logger.info("="*60)
-    
-    send_telegram_message(
-        f"🤖 <b>Bot ATTIVO - Tempo Reale</b>\n\n"
-        f"✅ Solo <b>0-0 → 1-0/0-1</b>\n"
-        f"✅ Solo entro <b>{MINUTE_CUTOFF}'</b> (tempo reale)\n"
-        f"✅ Quote <b>{BASELINE_MIN:.2f}-{BASELINE_MAX:.2f}</b>\n"
-        f"✅ Rise <b>+{MIN_RISE:.2f}</b>"
+        # Cleanup periodico (hard TTL o grace scaduta)
+        to_remove = []
+        for k, v in match_state.items():
+            if v.to_remove_at and now >= v.to_remove_at:
+                to_remove.append(k)
+            elif (now - v.first_seen_at) > STATE_HARD_TTL_SEC:
+                to_remove.append(k)
+        for k in to_remove:
+            match_state.pop(k, None)
+
+        time.sleep(CHECK_INTERVAL)
+
+    except KeyboardInterrupt:
+        logger.info("🛑 Stop richiesto dall'utente")
+        break
+    except Exception as e:
+        logger.exception("Errore nel loop: %s", e)
+        time.sleep(3)
+
+=========================
+
+Start
+
+=========================
+
+def main(): if not all([TELEGRAM_TOKEN, CHAT_ID, RAPIDAPI_KEY]): raise SystemExit("❌ Missing env vars: TELEGRAM_TOKEN, CHAT_ID, RAPIDAPI_KEY")
+
+logger.info("="*60)
+logger.info("🚀 BOT QUOTE JUMP – FIRST HALF ONLY")
+logger.info("="*60)
+logger.info("⚙️  Config:")
+logger.info("   • Range baseline: %.2f - %.2f", BASELINE_MIN, BASELINE_MAX)
+logger.info("   • Min rise: +%.2f", MIN_RISE)
+logger.info("   • Wait after goal: %ds", WAIT_AFTER_GOAL_SEC)
+logger.info("   • Check interval: %.1fs", CHECK_INTERVAL)
+logger.info("   • Max odds calls per loop: %d", MAX_ODDS_CALLS_PER_LOOP)
+logger.info("="*60)
+
+send_telegram_message(
+    (
+        f"🤖 <b>Bot ATTIVO – Solo PRIMO TEMPO</b>\n\n"
+        f"✅ Solo <b>0-0 → 1-0/0-1</b> (primo gol)\n"
+        f"✅ Considero solo eventi nel <b>1° tempo</b>\n"
+        f"✅ Quota post-gol in range <b>{BASELINE_MIN:.2f}-{BASELINE_MAX:.2f}</b>\n"
+        f"✅ Notifico se la quota <b>sale</b> di almeno <b>+{MIN_RISE:.2f}</b>\n"
     )
-    
-    main_loop()
+)
 
-if __name__ == "__main__":
-    main()
+main_loop()
+
+if name == "main": main()
