@@ -37,15 +37,15 @@ WAIT_AFTER_GOAL_SEC = int(os.getenv("WAIT_AFTER_GOAL_SEC", "45"))
 DEBUG_LOG       = os.getenv("DEBUG_LOG", "0") == "1"
 
 # Rate limiting
-MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "3"))
-ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "800"))
+MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "4"))
+ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "600"))
 _last_odds_call_ts_ms   = 0
 
 COOLDOWN_ON_DAILY_429_MIN = int(os.getenv("COOLDOWN_ON_DAILY_429_MIN", "30"))
 _last_daily_429_ts = 0
 
 LEAGUE_EXCLUDE_KEYWORDS = [kw.strip().lower() for kw in os.getenv(
-    "LEAGUE_EXCLUDE_KEYWORDS", "Esoccer,8 mins,Volta,H2H GG,Virtual"
+    "LEAGUE_EXCLUDE_KEYWORDS", "Esoccer,8 mins,Volta,H2H GG,Virtual,Baller League,30 mins,20 mins,10 mins,cyber,e-football,esports,fifa"
 ).split(",") if kw.strip()]
 
 HEADERS = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
@@ -451,21 +451,27 @@ def main_loop():
                             st.minute_captured = True
                             logger.info("📍 Minuto goal catturato: %d' per %s vs %s", game_minute, home, away)
                             
-                            # Verifica immediata: se già oltre cutoff, rifiuta subito
+                            # FILTRO: Solo primo tempo (max 45')
+                            if game_minute > 45:
+                                st.rejected_reason = f"goal_secondo_tempo_{game_minute}min"
+                                logger.info("⏭️ Goal al secondo tempo: %s vs %s (goal al %d')", 
+                                           home, away, game_minute)
+                                continue
+                            
+                            # Verifica cutoff standard
                             if game_minute > MINUTE_CUTOFF:
                                 st.rejected_reason = f"goal_oltre_{MINUTE_CUTOFF}min"
                                 logger.info("⏭️ Goal oltre %d': %s vs %s (goal al %d')", 
                                            MINUTE_CUTOFF, home, away, game_minute)
                                 continue
                         else:
-                            # Fallback: usa il tempo trascorso
-                            fallback_min = int((now - st.first_seen_at) / 60)
-                            st.goal_minute = fallback_min
+                            # Se non abbiamo il minuto dopo primo tentativo, segna come captured comunque
+                            # e lascia che il sistema proceda (funzionava già bene così)
+                            st.goal_minute = None
                             st.minute_captured = True
-                            logger.warning("⚠️ Minuto non disponibile API, usando fallback: %d' per %s vs %s", 
-                                         fallback_min, home, away)
+                            logger.warning("⚠️ Minuto non disponibile, continuo comunque: %s vs %s", home, away)
                     
-                    # Non procedere fino a quando non abbiamo il minuto
+                    # Procedi al prossimo step
                     continue
 
                 # Da qui: goal rilevato E minuto catturato
@@ -508,6 +514,9 @@ def main_loop():
                     if st.tries > 30:
                         st.rejected_reason = "no_odds_30_tries"
                         logger.warning("❌ No odds after 30 tries: %s vs %s", home, away)
+                    elif st.tries > 5:
+                        # Dopo 5 tentativi senza quote, probabilmente non sono disponibili
+                        logger.debug("Tentativo %d/30 senza quote per %s vs %s", st.tries, home, away)
                     continue
 
                 if odds.get("suspended"):
