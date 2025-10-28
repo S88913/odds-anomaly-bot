@@ -32,15 +32,15 @@ MIN_RISE        = float(os.getenv("MIN_RISE", "0.03"))
 BASELINE_MIN    = float(os.getenv("BASELINE_MIN", "1.30"))
 BASELINE_MAX    = float(os.getenv("BASELINE_MAX", "1.90"))
 CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "4"))
-WAIT_AFTER_GOAL_SEC = int(os.getenv("WAIT_AFTER_GOAL_SEC", "15"))  # RIDOTTO!
+WAIT_AFTER_GOAL_SEC = int(os.getenv("WAIT_AFTER_GOAL_SEC", "20"))  # 20s ottimale
 
 # Baseline sampling - PIÙ VELOCE
-BASELINE_SAMPLES = int(os.getenv("BASELINE_SAMPLES", "2"))  # 3→2
-BASELINE_SAMPLE_INTERVAL = int(os.getenv("BASELINE_SAMPLE_INTERVAL", "5"))  # 10→5
+BASELINE_SAMPLES = int(os.getenv("BASELINE_SAMPLES", "2"))
+BASELINE_SAMPLE_INTERVAL = int(os.getenv("BASELINE_SAMPLE_INTERVAL", "6"))  # 6s tra samples
 
 # Rate limiting - PIÙ AGGRESSIVO
-MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "8"))  # 1→8!
-ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "250"))  # 400→250ms
+MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "6"))  # 6 match per loop
+ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "300"))  # 300ms gap
 _last_odds_call_ts_ms   = 0
 
 # Priorità goal recenti (ultimi 2 minuti)
@@ -595,12 +595,13 @@ def main():
     logger.info("="*60)
     
     send_telegram_message(
-        f"🤖 <b>Bot FAST</b> ⚡\n\n"
+        f"🤖 <b>Bot FAST V2</b> ⚡\n\n"
         f"✅ 0-0 → 1-0/0-1\n"
         f"✅ Quote {BASELINE_MIN:.2f}-{BASELINE_MAX:.2f}\n"
         f"✅ Rise <b>+{MIN_RISE:.2f}</b>\n"
-        f"⚡ Wait {WAIT_AFTER_GOAL_SEC}s | {BASELINE_SAMPLES} samples\n\n"
-        f"🔍 Monitoraggio veloce attivo!"
+        f"⚡ Wait <b>{WAIT_AFTER_GOAL_SEC}s</b> | {BASELINE_SAMPLES} samples ogni {BASELINE_SAMPLE_INTERVAL}s\n"
+        f"⚡ Max {MAX_ODDS_CALLS_PER_LOOP} calls/loop\n\n"
+        f"🔍 Monitoraggio attivo!"
     )
     
     main_loop()
