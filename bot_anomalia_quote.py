@@ -27,19 +27,19 @@ RAPIDAPI_EVENTS_PATH   = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
 RAPIDAPI_EVENTS_PARAMS = dict(parse_qsl(os.getenv("RAPIDAPI_EVENTS_PARAMS", "sport=soccer")))
 RAPIDAPI_ODDS_PATH = os.getenv("RAPIDAPI_ODDS_PATH", "/live-events/{event_id}")
 
-# Business rules - OTTIMIZZATI
-MIN_RISE        = float(os.getenv("MIN_RISE", "0.03"))
+# Business rules
+MIN_RISE        = float(os.getenv("MIN_RISE", "0.04"))
 BASELINE_MIN    = float(os.getenv("BASELINE_MIN", "1.30"))
 BASELINE_MAX    = float(os.getenv("BASELINE_MAX", "1.90"))
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "6"))
-WAIT_AFTER_GOAL_SEC = int(os.getenv("WAIT_AFTER_GOAL_SEC", "30"))
+CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "5"))
+WAIT_AFTER_GOAL_SEC = int(os.getenv("WAIT_AFTER_GOAL_SEC", "45"))
 
-# Baseline sampling - campiona più quote per trovare il vero minimo
+# Baseline sampling
 BASELINE_SAMPLES = int(os.getenv("BASELINE_SAMPLES", "3"))
 BASELINE_SAMPLE_INTERVAL = int(os.getenv("BASELINE_SAMPLE_INTERVAL", "10"))
 
 # Rate limiting
-MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "5"))
+MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "1"))
 ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "400"))
 _last_odds_call_ts_ms   = 0
 
@@ -50,23 +50,24 @@ _last_daily_429_ts = 0
 MAX_API_RETRIES = 3
 API_RETRY_DELAY = 2
 
-# FILTRI LEGHE
+# FILTRI LEGHE - Lista completa
 LEAGUE_EXCLUDE_KEYWORDS = [
     "esoccer", "8 mins", "volta", "h2h gg", "virtual", 
     "baller", "30 mins", "20 mins", "10 mins", "12 mins",
     "cyber", "e-football", "esports", "fifa", "pes",
-    "simulated", "gtworld", "6 mins", "15 mins"
+    "simulated", "gtworld", "6 mins", "15 mins",
+    "torneo regional amateur", "regional", "amateur"  # Aggiunti filtri per tornei minori
 ]
 
 HEADERS = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
 
 # =========================
-# Stato match - MIGLIORATO
+# Stato match
 # =========================
 class MatchState:
     __slots__ = ("first_seen_at", "first_seen_score", "goal_time", "scoring_team", 
                  "baseline_samples", "baseline", "last_quote", "notified", 
-                 "tries", "last_check", "consecutive_errors")
+                 "tries", "last_check", "consecutive_errors", "last_seen_loop")
     
     def __init__(self):
         self.first_seen_at = time.time()
@@ -80,6 +81,7 @@ class MatchState:
         self.tries = 0
         self.last_check = 0
         self.consecutive_errors = 0
+        self.last_seen_loop = 0  # Per pulizia aggressiva
 
 match_state = {}
 _loop = 0
@@ -125,7 +127,6 @@ def http_get(url, headers=None, params=None, timeout=20, retries=MAX_API_RETRIES
                     _last_daily_429_ts = int(time.time())
                     logger.error("❌ HTTP 429 DAILY QUOTA REACHED")
                     return None
-                # Rate limit temporaneo, aspetta e riprova
                 if attempt < retries - 1:
                     time.sleep(API_RETRY_DELAY * (attempt + 1))
                     continue
@@ -223,11 +224,15 @@ def parse_price_any(x):
     
     return None
 
+def create_match_signature(home: str, away: str, league: str) -> str:
+    """Crea firma univoca per match (previene duplicati)"""
+    return f"{norm_name(home)}|{norm_name(away)}|{norm_name(league)}"
+
 # =========================
-# API - OTTIMIZZATE
+# API
 # =========================
 def get_live_matches():
-    """Recupera match live con filtraggio leghe"""
+    """Recupera match live con filtraggio migliorato"""
     url = build_url(RAPIDAPI_EVENTS_PATH)
     r = http_get(url, headers=HEADERS, params=RAPIDAPI_EVENTS_PARAMS, timeout=20)
     
@@ -242,11 +247,13 @@ def get_live_matches():
 
     raw = (data.get("data") or {}).get("events") or data.get("events") or []
     events = []
+    seen_signatures = set()  # Anti-duplicati robusto
 
     for it in raw:
         event_id = str(it.get("id") or it.get("event_id") or it.get("EId") or "")
         league = (it.get("league") or it.get("CT") or "").strip()
         
+        # Filtro leghe escluse
         if not league or is_excluded_league(league):
             continue
 
@@ -257,26 +264,30 @@ def get_live_matches():
         if not home or not away or not event_id:
             continue
 
+        # Verifica duplicati con firma
+        signature = create_match_signature(home, away, league)
+        if signature in seen_signatures:
+            logger.debug("Duplicato ignorato: %s vs %s", home, away)
+            continue
+        
+        seen_signatures.add(signature)
+
         events.append({
             "id": event_id,
             "home": home,
             "away": away,
             "league": league,
-            "score": score
+            "score": score,
+            "signature": signature
         })
 
-    # Rimuovi duplicati
-    unique = {}
-    for e in events:
-        if e["id"] not in unique:
-            unique[e["id"]] = e
-    
-    return list(unique.values())
+    logger.debug("Filtrati %d match da %d raw events", len(events), len(raw))
+    return events
 
 DRAW_TOKENS = {"draw", "x", "tie", "empate", "remis", "pareggio", "d", "égalité"}
 
 def extract_1x2(m, home_name: str, away_name: str):
-    """Estrae quote 1X2 con logica migliorata"""
+    """Estrae quote 1X2"""
     suspended = m.get("suspended") or m.get("SU")
     if isinstance(suspended, str):
         suspended = suspended.lower() in ("true", "1", "yes")
@@ -320,7 +331,7 @@ def extract_1x2(m, home_name: str, away_name: str):
     return None
 
 def get_odds_1x2(event_id: str, home: str, away: str):
-    """Recupera quote 1X2 con gestione errori robusta"""
+    """Recupera quote 1X2"""
     if not event_id:
         return None
         
@@ -368,7 +379,7 @@ def mark_odds_api_call():
     _last_odds_call_ts_ms = int(time.time() * 1000)
 
 # =========================
-# Main Loop - OTTIMIZZATO
+# Main Loop
 # =========================
 def main_loop():
     global _last_daily_429_ts, _loop
@@ -393,8 +404,15 @@ def main_loop():
                 continue
 
             _loop += 1
+            
+            # Segna match presenti in questo loop
+            current_match_ids = {m["id"] for m in live}
+            for eid in current_match_ids:
+                if eid in match_state:
+                    match_state[eid].last_seen_loop = _loop
+
             if _loop % 30 == 1:
-                logger.info("📊 Monitoring %d live matches | States: %d", len(live), len(match_state))
+                logger.info("📊 %d live matches (states: %d)", len(live), len(match_state))
 
             now = time.time()
             odds_calls = 0
@@ -411,14 +429,15 @@ def main_loop():
                 if eid not in match_state:
                     match_state[eid] = MatchState()
                     match_state[eid].first_seen_score = cur_score
+                    match_state[eid].last_seen_loop = _loop
 
                 st = match_state[eid]
+                st.last_seen_loop = _loop  # Aggiorna
 
                 # STEP 1: Rileva primo goal 0-0 → 1-0/0-1
                 if st.goal_time is None:
                     first_score = st.first_seen_score or (0, 0)
                     
-                    # Ignora match che non iniziano 0-0
                     if first_score != (0, 0):
                         continue
                     
@@ -443,7 +462,6 @@ def main_loop():
                 if cur_score != expected:
                     continue
 
-                # Già notificato
                 if st.notified:
                     continue
 
@@ -455,7 +473,6 @@ def main_loop():
                 if not can_call_odds_api() or odds_calls >= MAX_ODDS_CALLS_PER_LOOP:
                     continue
 
-                # Throttling per singolo match
                 if now - st.last_check < BASELINE_SAMPLE_INTERVAL:
                     continue
 
@@ -469,10 +486,10 @@ def main_loop():
                     st.consecutive_errors += 1
                     if st.consecutive_errors > 10:
                         logger.warning("⚠️ Troppi errori per %s vs %s, skip", home, away)
-                        st.notified = True  # Blocca per evitare loop
+                        st.notified = True
                     continue
 
-                st.consecutive_errors = 0  # Reset errori
+                st.consecutive_errors = 0
 
                 if odds.get("suspended"):
                     continue
@@ -482,19 +499,16 @@ def main_loop():
                 if scorer_price is None:
                     continue
 
-                # STEP 5: BASELINE - Campionamento migliorato
+                # STEP 5: BASELINE
                 if st.baseline is None:
-                    # Verifica range
                     if scorer_price < BASELINE_MIN or scorer_price > BASELINE_MAX:
                         logger.info("❌ Quota %.2f fuori range [%.2f-%.2f]: %s vs %s", 
                                    scorer_price, BASELINE_MIN, BASELINE_MAX, home, away)
-                        st.notified = True  # Blocca questo match
+                        st.notified = True
                         continue
                     
-                    # Aggiungi sample
                     st.baseline_samples.append(scorer_price)
                     
-                    # Quando abbiamo abbastanza campioni, prendi il minimo
                     if len(st.baseline_samples) >= BASELINE_SAMPLES:
                         st.baseline = min(st.baseline_samples)
                         logger.info("✅ Baseline %.2f stabilito (da %d campioni): %s vs %s", 
@@ -508,8 +522,6 @@ def main_loop():
 
                 # STEP 6: Monitora variazione
                 delta = scorer_price - st.baseline
-
-                # Aggiorna ultima quota
                 st.last_quote = scorer_price
 
                 # STEP 7: Salita rilevata
@@ -530,32 +542,34 @@ def main_loop():
                     )
                     
                     if send_telegram_message(msg):
-                        logger.info("✅ ALERT INVIATO: %s vs %s | %.2f → %.2f (+%.2f, +%.1f%%)", 
+                        logger.info("✅ ALERT: %s vs %s | %.2f → %.2f (+%.2f, +%.1f%%)", 
                                    home, away, st.baseline, scorer_price, delta, pct)
                     else:
-                        logger.error("❌ Invio Telegram fallito per %s vs %s", home, away)
+                        logger.error("❌ Invio Telegram fallito")
                     
                     st.notified = True
-                
-                elif _loop % 15 == 0 and st.baseline:
-                    # Log periodico per debugging
-                    logger.debug("📉 %s vs %s: %.2f (baseline %.2f, delta %.2f)", 
-                                home, away, scorer_price, st.baseline, delta)
 
-            # Pulizia stati vecchi (>3 ore)
-            to_remove = [k for k, v in match_state.items() if (now - v.first_seen_at) > 10800]
+            # PULIZIA AGGRESSIVA - Rimuove match non visti da 2+ loop o vecchi di 2+ ore
+            to_remove = []
+            for k, v in match_state.items():
+                age = now - v.first_seen_at
+                loops_ago = _loop - v.last_seen_loop
+                
+                if loops_ago > 2 or age > 7200:
+                    to_remove.append(k)
+            
             if to_remove:
-                logger.info("🧹 Rimozione %d stati vecchi", len(to_remove))
+                logger.info("🧹 Pulizia %d stati (non più live o vecchi)", len(to_remove))
                 for k in to_remove:
                     del match_state[k]
 
             time.sleep(CHECK_INTERVAL)
 
         except KeyboardInterrupt:
-            logger.info("🛑 Stop richiesto dall'utente")
+            logger.info("🛑 Stop")
             break
         except Exception as e:
-            logger.exception("❌ Errore nel main loop: %s", e)
+            logger.exception("❌ Errore main loop: %s", e)
             time.sleep(10)
 
 # =========================
@@ -563,33 +577,30 @@ def main_loop():
 # =========================
 def main():
     if not all([TELEGRAM_TOKEN, CHAT_ID, RAPIDAPI_KEY]):
-        raise SystemExit("❌ Variabili d'ambiente mancanti: TELEGRAM_TOKEN, CHAT_ID, RAPIDAPI_KEY")
+        raise SystemExit("❌ Variabili mancanti: TELEGRAM_TOKEN, CHAT_ID, RAPIDAPI_KEY")
     
     logger.info("="*70)
-    logger.info("🚀 BOT QUOTE JUMP - VERSIONE OTTIMIZZATA")
+    logger.info("🚀 BOT QUOTE JUMP - VERSIONE OTTIMIZZATA V2")
     logger.info("="*70)
-    logger.info("⚙️  Configurazione:")
+    logger.info("⚙️  Config:")
     logger.info("   • Scenario: 0-0 → 1-0/0-1")
     logger.info("   • Min rise: +%.2f", MIN_RISE)
     logger.info("   • Quota range: %.2f - %.2f", BASELINE_MIN, BASELINE_MAX)
     logger.info("   • Wait dopo goal: %ds", WAIT_AFTER_GOAL_SEC)
     logger.info("   • Check interval: %ds", CHECK_INTERVAL)
     logger.info("   • Baseline samples: %d (ogni %ds)", BASELINE_SAMPLES, BASELINE_SAMPLE_INTERVAL)
-    logger.info("   • Max API calls/loop: %d", MAX_ODDS_CALLS_PER_LOOP)
     logger.info("="*70)
     
     startup_msg = (
-        f"🤖 <b>Bot AVVIATO</b> ⚡\n\n"
+        f"🤖 <b>Bot AVVIATO V2</b> ⚡\n\n"
         f"✅ Solo <b>0-0 → 1-0/0-1</b>\n"
         f"✅ Solo <b>CALCIO VERO</b>\n"
         f"✅ Quote <b>{BASELINE_MIN:.2f}-{BASELINE_MAX:.2f}</b>\n"
-        f"✅ Rise minimo <b>+{MIN_RISE:.2f}</b>\n"
-        f"✅ Baseline da <b>{BASELINE_SAMPLES}</b> campioni\n\n"
+        f"✅ Rise minimo <b>+{MIN_RISE:.2f}</b>\n\n"
         f"🔍 Monitoraggio attivo..."
     )
     
     send_telegram_message(startup_msg)
-    
     main_loop()
 
 if __name__ == "__main__":
