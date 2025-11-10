@@ -43,7 +43,7 @@ WAIT_AFTER_GOAL_SEC = int(os.getenv("WAIT_AFTER_GOAL_SEC", "20"))
 BASELINE_SAMPLES = int(os.getenv("BASELINE_SAMPLES", "2"))
 BASELINE_SAMPLE_INTERVAL = int(os.getenv("BASELINE_SAMPLE_INTERVAL", "6"))
 
-MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "6"))  # qui rimane ma non si userà molto
+MAX_ODDS_CALLS_PER_LOOP = int(os.getenv("MAX_ODDS_CALLS_PER_LOOP", "6"))  # lasciato per compatibilità
 ODDS_CALL_MIN_GAP_MS    = int(os.getenv("ODDS_CALL_MIN_GAP_MS", "300"))
 _last_odds_call_ts_ms   = 0
 
@@ -509,14 +509,23 @@ def main_loop():
                     team_label = "1" if st.scoring_team == "home" else "2"
                     pct = (delta / st.baseline * 100)
 
-                    # Minuto preciso dalla live già parsata
+                    # Minuto preciso dalla live già parsata (versione safe senza escape in f-string)
                     period = match.get("period")
                     minute = match.get("minute")
                     stoppage = match.get("stoppage") or 0
-                    rec_str = ""
+
+                    period_str = period or ""
+                    minute_str = f"{minute}'" if minute is not None else ""
                     if stoppage:
-                        rec_str = f"+{stoppage//60}'" if stoppage >= 60 else f"+{stoppage}s"
-                    time_str = f"\n⏱ <b>{(period or '')} {(str(minute)+'\\'' if minute is not None else '')}{(' ' + rec_str) if rec_str else ''}</b>" if (period or minute is not None) else ""
+                        rec_str = f"+{stoppage // 60}'" if stoppage >= 60 else f"+{stoppage}s"
+                    else:
+                        rec_str = ""
+
+                    if (period or minute is not None):
+                        extra = f" {rec_str}" if rec_str else ""
+                        time_str = f"\n⏱ <b>{period_str} {minute_str}{extra}</b>"
+                    else:
+                        time_str = ""
 
                     msg = (
                         f"💰💎 <b>QUOTE JUMP</b> 💎💰\n\n"
